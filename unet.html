@@ -107,8 +107,8 @@
         '宏平均 <b style="color:#4fc3f7">IoU(Jaccard) ' + m.macro.iou + '</b> · <b style="color:#4fc3f7">F1(Dice) ' + m.macro.f1 + '</b>' +
         ' · Precision ' + m.macro.precision + ' · Recall ' + m.macro.recall + '<br/>' +
         '混淆统计: TP ' + (c.tp || 0) + ' · FP ' + (c.fp || 0) + ' · FN ' + (c.fn || 0) + ' · TN ' + (c.tn || 0) +
-        ' <span style="color:#6b8299">(像元数合计; FP 多为阴影/云区误提, 与 scene 级验证结论一致)</span>';
-        + (m.by_region ? '<br/>分区域 IoU: ' + Object.keys(m.by_region).map(function(k){ return k + ' ' + m.by_region[k]; }).join(' · ') : '')
+        ' <span style="color:#6b8299">(像元数合计; FP 多为阴影/云区误提, 与 scene 级验证结论一致)</span>'
+        + (m.by_region ? '<br/>分区域 IoU: ' + Object.keys(m.by_region).map(function(k){ return k + ' ' + m.by_region[k]; }).join(' · ') : '');
     }).catch(function() {});
 
     function doPredict() {

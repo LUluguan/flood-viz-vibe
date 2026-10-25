@@ -110,13 +110,17 @@ def test_assistant_intents():
     print("assistant OK")
 
 
-def test_realtime_rain():
+def test_realtime_rain(monkeypatch):
+    # 密封: 钉住演示回退路径(实况路径由 test_v16 + 真网浏览器验证覆盖;
+    # 本机对 Open-Meteo 的 DNS 忽通忽断, 不打桩会让"两次一致"断言抖动)
+    monkeypatch.setattr(app, "fetch_openmeteo", lambda **kw: None)
     c = _client()
     r = c.get("/api/realtime_rain")
     d = r.json()
     assert r.status_code == 200
     assert len(d["stations"]) == 5 and len(d["trend_12h"]) == 12
     assert d["intensity_level"] in ("无雨", "小雨", "中雨", "大雨", "暴雨")
+    assert "回退演示" in d["note"], d["note"]
     # 确定性: 同一时间窗内两次请求一致
     d2 = c.get("/api/realtime_rain").json()
     assert d["city_rain24h_mm"] == d2["city_rain24h_mm"]

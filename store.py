@@ -4,6 +4,7 @@
 import collections
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -132,7 +133,7 @@ def _save_reports(lst):
         except Exception as e:
             _log.exception("报讯存储降级期间拒绝覆盖写入(历史保留于 %s): %s",
                            _reports_degraded_from, e)
-            raise RuntimeError("报讯存储受损, 已保护现场, 拒绝覆盖写入")
+            raise RuntimeError("报讯存储受损, 已保护现场, 拒绝覆盖写入") from e
     _atomic_write_json(_reports_file(), lst)
 
 
@@ -140,7 +141,8 @@ def _save_reports(lst):
 def _load_subscribers():
     if os.path.exists(_SUBSCRIBERS_FILE):
         try:
-            v = json.load(open(_SUBSCRIBERS_FILE, encoding="utf-8"))
+            with open(_SUBSCRIBERS_FILE, encoding="utf-8") as f:
+                v = json.load(f)
             if isinstance(v, list):
                 return v
             _log.warning("subscribers.json 内容不是列表(类型 %s), 按空表处理", type(v).__name__)
@@ -154,8 +156,38 @@ def _save_subscribers(lst):
 
 
 # ==== 用户 store ====
+_PBKDF2_ITERS = 120_000   # PBKDF2 轮数(OWASP 2023 对 PBKDF2-HMAC-SHA256 的建议下限)
+
+
 def _hash_pw(pw, salt):
-    return hashlib.sha256((salt + pw).encode("utf-8")).hexdigest()
+    """口令哈希: PBKDF2-HMAC-SHA256(12 万轮), 存储格式 pbkdf2$轮数$盐$十六进制。
+    (2026-10 审计 BE-07/对标§四19: 原 sha256 单轮哈希可被 GPU 每秒数十亿次爆破)"""
+    dig = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                              salt.encode("utf-8"), _PBKDF2_ITERS)
+    return "pbkdf2$%d$%s$%s" % (_PBKDF2_ITERS, salt, dig.hex())
+
+
+def _verify_pw(pw, user):
+    """校验口令(常数时间比较); 兼容旧 sha256 单轮格式(登录时由 _upgrade_pw 平滑升级)。"""
+    h = str(user.get("hash", ""))
+    if h.startswith("pbkdf2$"):
+        try:
+            _, iters_s, _salt, dig = h.split("$", 3)
+            calc = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                                       user["salt"].encode("utf-8"), int(iters_s)).hex()
+        except (ValueError, KeyError):
+            return False
+        return hmac.compare_digest(calc, dig)
+    legacy = hashlib.sha256((user.get("salt", "") + pw).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy, h)
+
+
+def _upgrade_pw(users, idx, pw):
+    """旧格式验证成功后改写为 PBKDF2(幂等: 新格式直接跳过; 立即落盘)。"""
+    u = users[idx]
+    if not str(u.get("hash", "")).startswith("pbkdf2$"):
+        u["hash"] = _hash_pw(pw, u.get("salt") or uuid.uuid4().hex[:12])
+        _atomic_write_json(_AUTH_FILE, users)
 
 
 def _load_users():

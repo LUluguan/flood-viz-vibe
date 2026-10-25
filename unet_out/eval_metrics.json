@@ -63,5 +63,5 @@
     }
   ],
   "note": "指标在演示样本集上计算(非完整测试集); 训练细节见 train_unet.py, 评估脚本 tools/unet_metrics.py",
-  "generated_at": "2026-10-05 09:46"
+  "generated_at": "2026-10-13 14:20"
 }

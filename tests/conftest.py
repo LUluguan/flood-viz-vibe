@@ -18,4 +18,6 @@ def _isolate_stores(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_tokens", {})
     monkeypatch.setattr(app, "_REPORT_DIR", str(d))
     monkeypatch.setattr(store, "_report_rl", {})   # 频控表逐用例隔离(登录/订阅/报讯互不串扰)
+    # 测试密封性: 默认禁用真实 LLM/.env key(个别用例自行打桩回开), 防套件触外网
+    monkeypatch.setattr(app, "LLM_CFG", {"api_key": "", "base_url": "", "model": ""})
     yield

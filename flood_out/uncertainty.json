@@ -1,95 +1,95 @@
 {
-  "note": "设计暴雨 ±20%% 降雨敏感性包络(浴缸法同口径反演); 样本仅5年, 区间供参考",
+  "note": "设计暴雨 ±20%% 降雨敏感性包络(多洼地独立水面同口径反演); 样本仅5年, 区间供参考",
   "band_pct": 0.2,
   "scenarios": {
     "2": {
       "rain_mm": 118.5,
       "W": {
-        "low": 2.86,
-        "central": 3.11,
-        "high": 3.33
+        "low": 2.52,
+        "central": 2.68,
+        "high": 2.83
       },
       "area_km2": {
-        "low": 0.66,
-        "central": 0.792,
-        "high": 0.911
+        "low": 0.776,
+        "central": 0.888,
+        "high": 0.995
       },
       "max_depth_m": {
-        "low": 2.86,
-        "central": 3.11,
-        "high": 3.33
+        "low": 3.89,
+        "central": 4.13,
+        "high": 4.31
       }
     },
     "5": {
       "rain_mm": 166.3,
       "W": {
-        "low": 3.25,
-        "central": 3.52,
-        "high": 3.75
+        "low": 2.77,
+        "central": 2.96,
+        "high": 4.18
       },
       "area_km2": {
-        "low": 0.865,
-        "central": 1.026,
-        "high": 1.192
+        "low": 0.96,
+        "central": 1.082,
+        "high": 1.213
       },
       "max_depth_m": {
-        "low": 3.25,
-        "central": 3.52,
-        "high": 3.75
+        "low": 4.25,
+        "central": 4.47,
+        "high": 4.67
       }
     },
     "10": {
       "rain_mm": 198.9,
       "W": {
-        "low": 3.47,
-        "central": 3.75,
-        "high": 3.99
+        "low": 2.92,
+        "central": 4.18,
+        "high": 4.35
       },
       "area_km2": {
-        "low": 0.992,
-        "central": 1.19,
-        "high": 1.375
+        "low": 1.054,
+        "central": 1.209,
+        "high": 1.337
       },
       "max_depth_m": {
-        "low": 3.46,
-        "central": 3.75,
-        "high": 3.99
+        "low": 4.42,
+        "central": 4.67,
+        "high": 4.85
       }
     },
     "50": {
       "rain_mm": 270.6,
       "W": {
-        "low": 3.86,
-        "central": 4.16,
-        "high": 4.42
+        "low": 4.26,
+        "central": 4.46,
+        "high": 4.64
       },
       "area_km2": {
-        "low": 1.263,
-        "central": 1.523,
-        "high": 1.765
+        "low": 1.274,
+        "central": 1.435,
+        "high": 1.574
       },
       "max_depth_m": {
-        "low": 3.86,
-        "central": 4.16,
-        "high": 4.41
+        "low": 4.75,
+        "central": 5.0,
+        "high": 5.35
       }
     },
     "100": {
       "rain_mm": 300.6,
       "W": {
-        "low": 4.0,
-        "central": 4.31,
-        "high": 4.57
+        "low": 4.36,
+        "central": 4.57,
+        "high": 4.75
       },
       "area_km2": {
-        "low": 1.383,
-        "central": 1.656,
-        "high": 1.931
+        "low": 1.342,
+        "central": 1.509,
+        "high": 1.664
       },
       "max_depth_m": {
-        "low": 4.0,
-        "central": 4.3,
-        "high": 4.56
+        "low": 4.86,
+        "central": 5.14,
+        "high": 5.69
       }
     }
   }

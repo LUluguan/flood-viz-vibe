@@ -18,7 +18,7 @@ jobs:
       - name: Rebuild delivery copy
         run: python tools/sync_delivery.py
       - name: Ruff (real errors only: syntax + pyflakes)
-        run: ruff check --select E9,F63,F7,F82,F81,F401,F811,F841 app.py store.py pipeline_config.py flood_render.py tools/ tests/
+        run: ruff check --select E9,F63,F7,F82,F81,F401,F811,F841 app.py store.py pipeline_config.py flood_render.py flood_core.py externals.py tools/ tests/
       - name: Run offline tests
         env:
           PYTHONPATH: ${{ github.workspace }}

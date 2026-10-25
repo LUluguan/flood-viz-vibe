@@ -22,25 +22,13 @@ import rasterio
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from pipeline_config import (RUNOFF_COEF, DEPTH_THRESH, CELL_LAT, cell_area_m2,
                              RETURNS_FALLBACK as returns_fallback)  # 唯一权威常量
+from flood_core import DepressionModel   # 多洼地浴缸法唯一实现(对标§四1, 替代本地副本)
 DTM_PATH = os.path.join(ROOT, "dem", "study_dtm.tif")
 STORM_JSON = os.path.join(ROOT, "flood_out", "design_storm_24h.json")
 OUT_JSON = os.path.join(ROOT, "flood_out", "uncertainty.json")
 BAND = 0.20          # 降雨敏感性 ±20%
 BANDS = (1.0 - BAND, 1.0, 1.0 + BAND)
 KEYS = ("low", "central", "high")
-
-
-def bathtub_w(z, q):
-    """陆域体积守恒: 求 W 使陆域(z>0)平均水深=q(与 bathtub_flood.bathtub 同算法)。"""
-    land = z > 0
-    lo, hi = 0.0, float(z.max()) + q
-    for _ in range(60):
-        W = 0.5 * (lo + hi)
-        if float(np.clip(W - z[land], 0, None).mean()) < q:
-            lo = W
-        else:
-            hi = W
-    return 0.5 * (lo + hi)
 
 
 def main():
@@ -56,17 +44,18 @@ def main():
     z = np.clip(z, -15.0, None)
     land = z > 0
     area_m2 = cell_area_m2(transform, CELL_LAT)
+    model = DepressionModel(z)      # 填洼/洼地/汇水预计算一次, 三档复用
 
-    out = {"note": "设计暴雨 ±20%% 降雨敏感性包络(浴缸法同口径反演); 样本仅5年, 区间供参考",
+    out = {"note": "设计暴雨 ±20%% 降雨敏感性包络(多洼地独立水面同口径反演); 样本仅5年, 区间供参考",
            "band_pct": BAND, "scenarios": {}}
     for T in sorted(returns):
         R = returns[T]
         entry = {"rain_mm": R, "W": {}, "area_km2": {}, "max_depth_m": {}}
         for key, f in zip(KEYS, BANDS):
             q = R * f / 1000.0 * RUNOFF_COEF
-            W = bathtub_w(z, q)
-            depth = np.clip(W - z, 0, None)
+            depth, finfo = model.flood(q, area_m2)
             flooded = (depth > DEPTH_THRESH) & land
+            W = finfo["water_level_m"]
             entry["W"][key] = round(float(W), 2)
             entry["area_km2"][key] = round(float(flooded.sum() * area_m2) / 1e6, 3)
             entry["max_depth_m"][key] = round(float(depth[flooded].max()), 2) if flooded.any() else 0.0

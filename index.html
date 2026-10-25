@@ -244,6 +244,10 @@
         <div class="btn" id="bandBtn" style="flex:1">📊 不确定性区间</div>
         <div class="btn" id="tileBtn" style="flex:1">🧩 水深瓦片图层</div>
       </div>
+      <div class="stormrow">
+        <div class="btn" id="ensBtn" style="flex:1">🎲 集合概率场</div>
+        <div class="btn" id="cascadeBtn" style="flex:1">⚡ 设施连锁</div>
+      </div>
       <div class="evlist" id="evList" style="display:none"></div>
       <div class="hshead">⚠ 易涝点 Top8<span style="float:right;color:#5f7893">点击定位</span></div>
       <div class="hslist" id="hsList"></div>
@@ -259,11 +263,17 @@
         <input id="cSlider" type="range" min="0.30" max="0.80" step="0.05" value="0.50" />
         <span id="cVal">0.50</span><span id="cTag">现状城市</span>
       </div>
+      <div class="crow">
+        <span>排水折减</span>
+        <input id="drainSlider" type="range" min="0" max="40" step="2" value="0" />
+        <span id="drainVal">0mm</span><span id="drainTag">现状管网</span>
+      </div>
       <div class="stats" id="ostats"></div>
       <div class="stormrow"><div class="btn" id="stormBtn2" style="flex:1">▶ 播放 24h 淹没演进</div></div>
+      <div class="stormrow"><div class="btn" id="fcBtn" style="flex:1">🌧 72h 降雨预报推演</div></div>
       <div class="hshead">⚠ 易涝点 Top5</div>
       <div class="hslist" id="ohsList"></div>
-      <div class="onote" id="onote">浴缸法实时反演(与重现期场景同口径)：雨量 × 径流系数 C → 径流深 → 水位W → 水深。C 越小代表海绵城市/透水铺装改造程度越高。118.5–300.6mm 为 2–100 年设计范围，超出为外推。</div>
+      <div class="onote" id="onote">多洼地独立水面实时反演(与重现期场景同口径)：雨量 × C − 排水折减 → 逐洼地水位。C 越小代表海绵城市改造程度越高; 排水折减>0 为泵站/管网工程预案(对标数字孪生"预演工程调度")。118.5–300.6mm 为 2–100 年设计范围，超出为外推。</div>
     </div>
 
     <div id="realSection" class="hidden">
@@ -602,43 +612,44 @@
     }
     try { createCantonTower(); } catch (e) { console.error('广州塔建模失败:', e); }
 
-    // ===== 三维水体(涨水动画实体 + 静止态 Water 原生材质: 法线扰动/波光/岸线泡沫) =====
-    var waterLevel = { v: 0 };           // 当前动画水位(m)
+    // ===== 三维水体(多洼地独立水面: 每个淹没多边形携带自身水位W, 整体比例 0→1 涨水动画) =====
+    var waterScale = { v: 1 };           // 水面整体比例(涨水动画驱动)
     var waterEntities = [];
     var foamEntities = [];
-    var waterPrimitive = null;           // Cesium 原生 Water 材质水面(静止态)
     var _wAnim = null;
     var waterBuildSeq = 0;
     function animateWaterTo(target, ms) {
+      // 多洼地改造(对标§四1): 各斑块水位独立, 动画统一驱动"比例 0→1"; target 仅保留兼容
       if (_wAnim) cancelAnimationFrame(_wAnim);
-      if (!ms) { waterLevel.v = target; return; }
-      var from = waterLevel.v, t0 = Date.now();
+      if (!ms) { waterScale.v = (target === 0 ? 0 : 1); return; }
+      var from = 0, t0 = Date.now();     // 每次重建从头播放完整涨水过程
       (function step() {
         var k = Math.min(1, (Date.now() - t0) / ms);
-        var e = 1 - Math.pow(1 - k, 3);              // easeOutCubic
-        waterLevel.v = from + (target - from) * e;
+        waterScale.v = from + (1 - from) * (1 - Math.pow(1 - k, 3));   // easeOutCubic
         if (k < 1) _wAnim = requestAnimationFrame(step); else _wAnim = null;
       })();
+    }
+    function polyW(f, W) {               // 斑块水位: properties.W(逐洼地)优先, 兼容无属性要素(GeoScene/旧数据)
+      var w = f && f.properties && f.properties.W;
+      return (isFinite(w) && w > 0) ? w : W;
     }
     function removeWaterVisuals() {
       waterEntities.forEach(function(e) { viewer.entities.remove(e); });
       waterEntities = [];
       foamEntities.forEach(function(e) { viewer.entities.remove(e); });
       foamEntities = [];
-      if (waterPrimitive) {
-        try { viewer.scene.primitives.remove(waterPrimitive); } catch (e) {}
-        waterPrimitive = null;
-      }
     }
     function clearWater() {
       waterBuildSeq++;
       removeWaterVisuals();
     }
-    // 岸线泡沫: 沿淹没斑块边缘的白色亮线(仅在原生水面态显示)
+    // 岸线泡沫: 沿淹没斑块边缘的白色亮线(按各斑块自身水位)
     function addFoam(features, W) {
       if (!W || W <= 0) return;
-      var budget = 24000, z = W + 0.06;
+      var budget = 24000;
       for (var i = 0; i < features.length && budget > 0; i++) {
+        var z = polyW(features[i], W) + 0.06;
+        if (!(z > 0)) continue;
         var ring = features[i].geometry && features[i].geometry.coordinates &&
           features[i].geometry.coordinates[0];
         if (!ring || ring.length < 5) continue;
@@ -705,12 +716,14 @@
         for (var i = 0; i < features.length; i++) {
           var f = features[i];
           if (!f.geometry || !f.geometry.coordinates || !f.geometry.coordinates[0]) continue;
+          var w = polyW(f, W);
+          if (!(w > 0)) continue;
           var pos = [];
           f.geometry.coordinates[0].forEach(function(p) { pos.push(p[0], p[1]); });
           waterEntities.push(viewer.entities.add({
             polygon: {
               hierarchy: Cesium.Cartesian3.fromDegreesArray(pos),
-              height: W, extrudedHeight: W + 0.04,   // 贴在水面上的纹理层
+              height: w, extrudedHeight: w + 0.04,   // 贴在该斑块水面上的纹理层
               material: detailMat
             }
           }));
@@ -722,16 +735,20 @@
     }
     function buildWater(features, W, animate, light) {
       // light=true(24h 演进步进): 只建基础水体, 跳过纹理/泡沫细节层(每步全量重建 ~1250 实体会互相打断掉帧)
+      // 多洼地: 每个淹没多边形按自身 properties.W 独立挤出水面(对标§四1)
       removeWaterVisuals();
       var seq = ++waterBuildSeq;
+      waterScale.v = animate ? 0 : 1;
       (features || []).forEach(function(f) {
         if (!f.geometry || !f.geometry.coordinates || !f.geometry.coordinates[0]) return;
         var pos = []; f.geometry.coordinates[0].forEach(function(p) { pos.push(p[0], p[1]); });
+        var w = polyW(f, W);
+        if (!(w > 0)) return;
         waterEntities.push(viewer.entities.add({
           polygon: {
             hierarchy: Cesium.Cartesian3.fromDegreesArray(pos),
             height: 0,
-            extrudedHeight: new Cesium.CallbackProperty(function() { return waterLevel.v; }, false),
+            extrudedHeight: new Cesium.CallbackProperty(function() { return w * waterScale.v; }, false),
             material: new Cesium.ColorMaterialProperty(new Cesium.CallbackProperty(function() {
               return Cesium.Color.fromCssColorString('#2196f3').withAlpha(0.44 + 0.07 * Math.sin(Date.now() / 1100));
             }, false))
@@ -891,7 +908,6 @@
       document.getElementById('zoneOverlay').style.display = isReal ? 'none' : '';
       waterEntities.forEach(function(e) { e.show = !isReal; });
       foamEntities.forEach(function(e) { e.show = !isReal; });
-      if (waterPrimitive) waterPrimitive.show = !isReal;
       realEntities.forEach(function(e) { e.show = isReal; });
       Object.keys(realLayers).forEach(function(k) { realLayers[k].show = isReal && (k === curRealLayer); });
       if (isReal && REAL) {
@@ -1164,6 +1180,8 @@
       fetchZones(T); fetchImpact(T); fetchHotspots(T); fetchWarning(T);
       clearEvac();
       if (typeof refreshTileLayer === 'function') refreshTileLayer();   // 水深瓦片随情景切换
+      if (typeof refreshEnsLayer === 'function') refreshEnsLayer();     // 集合概率场随情景切换
+      if (typeof clearCascade === 'function') clearCascade();           // 设施连锁随情景清空
       if (bandOn) renderBand();                                          // 不确定性带随情景刷新
     }
 
@@ -1180,7 +1198,7 @@
       var tot = cum[cum.length - 1];
       return xs.map(function(x, i) { return { x: x, f: cum[i] / tot }; });
     }
-    function stormUrl(Rt, c) { return '/api/online_sim?rain_mm=' + Rt.toFixed(1) + '&c=' + c; }
+    function stormUrl(Rt, c) { return '/api/online_sim?rain_mm=' + Rt.toFixed(1) + '&c=' + c + '&drain_mm=' + curDrain(); }
     function playStorm(R, c) {
       stopStorm();
       var K = 8, cf = triCumFrac();   // 8 步: 步距 1.55s > 动画 900ms, 避免步间互相打断掉帧
@@ -1232,6 +1250,7 @@
     // ===== 在线模拟: 自定义 24h 雨量 + 径流系数 C → 后端浴缸法实时反演 =====
     var onlineSeq = 0;
     function curC() { return parseFloat(document.getElementById('cSlider').value); }
+    function curDrain() { return parseFloat(document.getElementById('drainSlider').value) || 0; }
     function cTagText(c) {
       if (c <= 0.40) return '海绵城市';
       if (c <= 0.55) return '现状城市';
@@ -1241,6 +1260,31 @@
       document.getElementById('cVal').textContent = curC().toFixed(2);
       document.getElementById('cTag').textContent = cTagText(curC());
     });
+    document.getElementById('drainSlider').addEventListener('input', function() {
+      document.getElementById('drainVal').textContent = curDrain() + 'mm';
+      document.getElementById('drainTag').textContent = curDrain() > 0 ? '工程预案' : '现状管网';
+    });
+    // ===== 72h 降雨预报推演(Open-Meteo 预报驱动, 对标§四10) =====
+    document.getElementById('fcBtn').onclick = function() {
+      var btn = this;
+      btn.disabled = true;
+      document.getElementById('status').innerHTML = '正在获取 72h 降雨预报(Open-Meteo)并推演内涝…';
+      fetch('/api/forecast_flood?c=' + curC()).then(function(r) { return r.json(); }).then(function(d) {
+        btn.disabled = false;
+        if (d.error) throw new Error(d.error);
+        var tl = (d.series || []).map(function(s) {
+          return 'T+' + s.t_h + 'h ' + s.rain_cum_mm + 'mm→' + s.flooded_area_km2 + 'km²(' + s.city_level + ')';
+        }).join(' · ');
+        buildWater(d.extent.features || [], 0, false);   // 逐斑块自带 W
+        lastSim = { features: d.extent.features || [], W: 0 };
+        document.getElementById('status').innerHTML =
+          '🌧 72h 预报推演(源: ' + d.source + '): ' + tl +
+          ' · 最不利 T+' + d.worst_t_h + 'h(预报有不确定性, 供趋势参考)';
+      }).catch(function(e) {
+        btn.disabled = false;
+        document.getElementById('status').innerHTML = '⚠ 预报推演失败: ' + ((e && e.message) || '网络错误');
+      });
+    };
     function renderOnlineStats(d) {
       var im = d.impact || {};
       var popTxt = im.affected_population === undefined ? '--' :
@@ -1273,7 +1317,7 @@
       btn.disabled = true;
       var seq = ++onlineSeq;
       showLoading();
-      fetch('/api/online_sim?rain_mm=' + v + '&c=' + c).then(function(r) { return r.json(); }).then(function(d) {
+      fetch('/api/online_sim?rain_mm=' + v + '&c=' + c + '&drain_mm=' + curDrain()).then(function(r) { return r.json(); }).then(function(d) {
         btn.disabled = false;
         if (seq !== onlineSeq) return;
         if (d.error) throw new Error(d.error);
@@ -1594,6 +1638,74 @@
       document.getElementById('status').innerHTML = tileOn ?
         '水深瓦片图层已开启(预渲染 XYZ 切片 z9–z14, 与 NOAA FIM 静态淹没服务同模式)' : '水深瓦片图层已关闭';
     };
+    // -- 集合概率场图层(蒙特卡洛成员淹没频率, 紫色随概率加深, 对标§四5/GloFAS 概率制图) --
+    var ensOn = false, ensLayer = null;
+    function refreshEnsLayer() {
+      if (ensLayer) { viewer.imageryLayers.remove(ensLayer); ensLayer = null; }
+      if (!ensOn || !curT) return;
+      ensLayer = viewer.imageryLayers.addImageryProvider(new Cesium.SingleTileImageryProvider({
+        url: '/api/ensemble_png?return_period=' + curT,
+        rectangle: Cesium.Rectangle.fromDegrees(B.west, B.south, B.east, B.north) }));
+      ensLayer.alpha = 0.85;
+      FLOOD.getJSON('/api/ensemble?return_period=' + curT).then(function(d) {
+        document.getElementById('status').innerHTML =
+          '🎲 集合概率场已叠加: ' + d.members + ' 成员(雨量±20%×C±0.07) · 主涝区水位 P10/P50/P90 = ' +
+          d.W_p10 + '/' + d.W_p50 + '/' + d.W_p90 + ' m · 淹没面积区间 ' +
+          d.flooded_area_km2_range[0] + '–' + d.flooded_area_km2_range[1] + ' km²(紫色越深概率越高)';
+      }).catch(function() {});
+    }
+    document.getElementById('ensBtn').onclick = function() {
+      ensOn = !ensOn;
+      this.classList.toggle('active', ensOn);
+      refreshEnsLayer();
+    };
+    // -- 设施受淹与服务缺口(对标§四16 简化版): 受损设施红pin + 半径内受淹建筑缺口线 --
+    var cascadeEntities = [];
+    function clearCascade() {
+      cascadeEntities.forEach(function(e) { viewer.entities.remove(e); });
+      cascadeEntities = [];
+    }
+    function renderCascade(d) {
+      clearCascade();
+      (d.nodes || []).forEach(function(n) {
+        if (!n.failed) return;
+        cascadeEntities.push(viewer.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(n.lon, n.lat, 0),
+          point: { pixelSize: 11, color: Cesium.Color.fromCssColorString('#e53935'),
+                   outlineColor: Cesium.Color.WHITE, outlineWidth: 2 },
+          label: { text: (n.kind || '') + '·受损 ' + n.depth_m + 'm',
+                   font: '12px "Microsoft YaHei"', fillColor: Cesium.Color.WHITE,
+                   showBackground: true, backgroundColor: Cesium.Color.fromCssColorString('#b71c1c').withAlpha(0.85),
+                   pixelOffset: new Cesium.Cartesian2(0, -24),
+                   distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 20000) }
+        }));
+      });
+      (d.edges || []).forEach(function(e0) {
+        cascadeEntities.push(viewer.entities.add({
+          polyline: {
+            positions: Cesium.Cartesian3.fromDegreesArrayHeights([
+              e0.from.lon, e0.from.lat, 30, e0.to.lon, e0.to.lat, 10]),
+            width: 1.6, material: new Cesium.PolylineDashMaterialProperty({
+              color: Cesium.Color.fromCssColorString('#ff8a65').withAlpha(0.75), dashLength: 12 })
+          }
+        }));
+      });
+      document.getElementById('status').innerHTML =
+        '⚡ 设施连锁(简化版): 关键设施 ' + d.total + ' 处, 场地积水>0.5m 受损 <b style="color:#ef9a9a">' +
+        d.failed + '</b> 处; 电网节点 ' + d.grid_nodes + ' 个。' + FLOOD.esc(d.note || '');
+    }
+    document.getElementById('cascadeBtn').onclick = function() {
+      if (typeof curT !== 'number') { return; }
+      var btn = this;
+      btn.disabled = true;
+      FLOOD.getJSON('/api/cascade?return_period=' + curT).then(function(d) {
+        btn.disabled = false;
+        renderCascade(d);
+      }).catch(function(e) {
+        btn.disabled = false;
+        document.getElementById('status').innerHTML = '⚠ 设施连锁分析失败: ' + FLOOD.esc((e && e.message) || '网络错误');
+      });
+    };
     // -- 已核实的公众报汛上图(上报—核实—处置闭环的可视端) --
     var reportPinEntities = [];
     function fetchReportPins() {
@@ -1738,9 +1850,80 @@
       var tok = localStorage.getItem('flood_token');
       var chip = document.getElementById('userChip');
       if (!tok || !chip) return;
-      fetch('/api/auth/me?token=' + tok).then(function(r) { return r.json(); }).then(function(u) {
-        if (u && u.username) chip.innerHTML = '👤 ' + u.username + '(' + u.role + ') · <a href="mobile.html">报汛管理</a>';
+      // token 走请求头(2026-10 审计 FE-01: query 里的 token 会进访问日志与浏览器历史)
+      fetch('/api/auth/me', { headers: { 'x-auth-token': tok } }).then(function(r) { return r.json(); }).then(function(u) {
+        if (u && u.username) chip.innerHTML = '👤 ' + FLOOD.esc(u.username) + '(' + FLOOD.esc(u.role) + ') · <a href="mobile.html">报汛管理</a>';
       }).catch(function() {});
+    })();
+
+    // ===== 单点水淹过程线(对标§四13: 点击三维场景任意点, 查询 24h 水深时间序列) =====
+    (function() {
+      var panel = document.createElement('div');
+      panel.id = 'hydroPanel';
+      panel.style.cssText = 'position:absolute;right:14px;top:92px;width:308px;background:rgba(13,25,38,.93);color:#dbe9f7;border:1px solid #2b4a63;border-radius:10px;padding:12px;font-size:12px;z-index:40;display:none;box-shadow:0 4px 16px rgba(0,0,0,.45);line-height:1.5';
+      document.body.appendChild(panel);
+      var marker = null;
+      panel.addEventListener('click', function(ev) {
+        if (ev.target && ev.target.className === 'hclose') {
+          panel.style.display = 'none';
+          if (marker) { viewer.entities.remove(marker); marker = null; }
+        }
+      });
+      function head() {
+        return '<div style="display:flex;justify-content:space-between;align-items:center"><b>单点水淹过程线</b><span class="hclose" style="cursor:pointer;color:#8fb7d4;padding:0 4px">✕</span></div>';
+      }
+      function draw(d) {
+        var s = d.series || [];
+        var maxD = Math.max(0.1, d.peak_depth_m || 0);
+        var W = 282, H = 108, pad = 6;
+        function poly(getter, scale) {
+          return s.map(function(p, i) {
+            var x = pad + i / Math.max(1, s.length - 1) * (W - 2 * pad);
+            var y = H - pad - (getter(p) / scale) * (H - 2 * pad - 6);
+            return x.toFixed(1) + ',' + y.toFixed(1);
+          }).join(' ');
+        }
+        var depthLine = poly(function(p) { return p.depth_m; }, maxD);
+        var rainLine = poly(function(p) { return p.rain_cum_mm; }, Math.max(1, d.rain_mm));
+        panel.innerHTML = head() +
+          '<div style="color:#9fc3e0;margin:4px 0">' + d.lon.toFixed(5) + ', ' + d.lat.toFixed(5) +
+          ' · 地面 ' + d.ground_m + ' m · ' + d.rain_mm + 'mm(C=' + d.c + ')</div>' +
+          '<svg width="' + W + '" height="' + H + '" style="background:#0e1c2a;border-radius:6px;display:block">' +
+          '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" stroke="#2b4a63" stroke-width="1"/>' +
+          '<polyline points="' + rainLine + '" fill="none" stroke="#7e8ca0" stroke-width="1" stroke-dasharray="3 2"/>' +
+          '<polyline points="' + depthLine + '" fill="none" stroke="#42a5f5" stroke-width="2"/></svg>' +
+          '<div style="margin-top:4px">开始淹没 <b style="color:#ffb300">' +
+          (d.onset_t_h === null ? '不淹没' : 'T+' + d.onset_t_h + 'h') +
+          '</b> · 峰值水深 <b style="color:#42a5f5">' + d.peak_depth_m + ' m</b> · 峰值比例上限 ' + maxD.toFixed(2) + 'm</div>' +
+          '<div style="color:#7e93a8">蓝实线: 水深过程 · 灰虚线: 累积降雨(归一)</div>' +
+          '<div style="color:#7e93a8">三角雨型(峰现0.4) + 多洼地体积守恒反演; 单调涨水段(无退水)</div>';
+        panel.style.display = 'block';
+      }
+      var handler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
+      handler.setInputAction(function(movement) {
+        var cartesian = viewer.camera.pickEllipsoid(movement.position, viewer.scene.globe.ellipsoid);
+        if (!cartesian) return;
+        var cg = Cesium.Cartographic.fromCartesian(cartesian);
+        var lon = Cesium.Math.toDegrees(cg.longitude), lat = Cesium.Math.toDegrees(cg.latitude);
+        if (lon < 113.295 || lon > 113.345 || lat < 23.085 || lat > 23.135) return;
+        var s = (typeof SCENARIOS !== 'undefined' && SCENARIOS && typeof curT === 'number')
+          ? SCENARIOS.find(function(x) { return x.return_period_y === curT; }) : null;
+        var rain = s ? s.rain_mm : 200;
+        if (marker) viewer.entities.remove(marker);
+        marker = viewer.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(lon, lat),
+          point: { pixelSize: 9, color: Cesium.Color.fromCssColorString('#ffb300'),
+                   outlineColor: Cesium.Color.WHITE, outlineWidth: 2 }
+        });
+        panel.style.display = 'block';
+        panel.innerHTML = head() + '<div style="color:#9fc3e0;padding:6px 0">查询过程线中…</div>';
+        fetch('/api/hydrograph?lon=' + lon.toFixed(5) + '&lat=' + lat.toFixed(5) + '&rain_mm=' + rain + '&c=0.5')
+          .then(function(r) { return r.json(); })
+          .then(function(d) { if (d.error) throw new Error(d.error); draw(d); })
+          .catch(function(e) {
+            panel.innerHTML = head() + '<div style="color:#ef9a9a;padding:4px 0">' + FLOOD.esc((e && e.message) || '查询失败') + '</div>';
+          });
+      }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
     })();
 
     viewer.camera.setView({

@@ -292,6 +292,7 @@
     // 水深分布/预警等级/分区柱状随重现期联动
     function loadHist(T) {
       fetch('/api/depth_hist?return_period=' + T).then(function(r) { return r.json(); }).then(function(h) {
+        if (h && h.error) throw new Error(h.error);
         if (!h || !h.counts) return;
         hist = h;
         document.getElementById('cDepthTitle').textContent = '水深分布(' + T + '年一遇)';
@@ -302,6 +303,9 @@
             return { name: k + '色预警', value: h.warn[k], itemStyle: { color: warnColors[k] } };
           }) }]
         });
+      }).catch(function(e) {   // 2026-10 审计 FE-09: 失败不再静默(unhandled rejection), 图表停留旧数据并提示
+        var el = document.getElementById('cDepthTitle');
+        if (el) el.textContent = '水深分布(获取失败: ' + ((e && e.message) || '网络错误') + ')';
       });
       loadZone(T);
     }

@@ -16,6 +16,9 @@ docx_full.txt
 __pycache__/
 *.pyc
 *.pyo
+.coverage
+.ruff_cache/
+.pytest_cache/
 
 # ===== 临时/环境 =====
 tmp_*
@@ -50,7 +53,10 @@ flood_out/flood_tiles/
 data_raw/
 
 # ===== 用户数据(账号表/订阅者/上传照片/损坏隔离件), 不入公开仓库 =====
+# 注意: reports.json 含公众自由文本上报(可能带个人信息), 2026-10 审计 BE-03 起不入库;
+# 演示种子数据如需保留, 另存 reports/reports.demo.json(该文件允许入库)
 web_users.json
+reports/reports.json
 reports/subscribers.json
 reports/img_*
 reports/*.corrupt-*

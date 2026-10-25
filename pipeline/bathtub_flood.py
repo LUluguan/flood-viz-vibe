@@ -28,6 +28,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 # 研究区与算法常量: 全仓唯一权威定义(原 7 处重复常量已收拢)
 from pipeline_config import RUNOFF_COEF, DEPTH_THRESH, cell_area_m2  # 唯一权威定义
+from flood_core import DepressionModel   # 多洼地独立水面浴缸法(唯一实现, 对标§四1)
 
 DEM_PATH = os.path.join(ROOT, "dem", "study_dem.tif")
 BLD_PATH = os.path.join(ROOT, "gz_tower_buildings.geojson")
@@ -84,28 +85,6 @@ def remove_buildings(z, transform):
     return a.astype("float32")
 
 
-def bathtub(z, q):
-    """陆域体积守恒: 求水面高程 W 使陆域(z>0)平均水深 = q(米)。返回 (W, depth)。"""
-    land = z > 0
-    lo, hi = 0.0, float(z.max())
-    for _ in range(60):
-        W = 0.5 * (lo + hi)
-        if float(np.clip(W - z[land], 0, None).mean()) < q:
-            lo = W
-        else:
-            hi = W
-    W = 0.5 * (lo + hi)
-    depth = np.clip(W - z, 0, None)
-    return W, depth.astype("float32")
-
-
-# cell_area_m2 已上提 pipeline_config(面积换算唯一权威, ARC-01)
-
-
-def polygonize(mask, transform):
-    return [g for g, v in shapes(mask.astype("uint8"), transform=transform) if v == 1]
-
-
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
     z, transform = load_dem()
@@ -123,11 +102,13 @@ def main():
 
     land = z > 0
     area = cell_area_m2(transform)
+    model = DepressionModel(z)          # 填洼/洼地/汇水预计算(五档共用)
+    dep_lab2d = model._dep_lab.reshape(z.shape)
     scenarios = []
 
     for T, R in RETURNS.items():
         q = R / 1000.0 * RUNOFF_COEF          # 径流深(米)
-        W, depth = bathtub(z, q)
+        depth, finfo = model.flood(q, area)
 
         flooded = (depth > DEPTH_THRESH) & land   # 新淹没陆地(不含常年河道)
         area_km2 = float(flooded.sum() * area) / 1e6
@@ -139,27 +120,44 @@ def main():
                            nodata=TIF_NODATA) as dst:
             dst.write(depth, 1)
 
-        polys = polygonize(flooded, transform)
+        # 逐洼地矢量化: 每个淹没多边形携带自身水面 W(properties.W),
+        # 前端据此对每个斑块独立挤出水面(替代旧全局单水面)
+        w_by_dep = {l["dep"]: l["W_m"] for l in finfo["levels"]}
+        feats = []
+        for d, W_d in w_by_dep.items():
+            m = flooded & (dep_lab2d == d)
+            if not m.any():
+                continue
+            for g, v in shapes(m.astype("uint8"), mask=m, transform=transform):
+                if v == 1:
+                    feats.append({"type": "Feature", "geometry": g,
+                                  "properties": {"W": round(float(W_d), 2)}})
         gj = {"type": "FeatureCollection",
               "crs": {"type": "name", "properties": {"name": "EPSG:4326"}},
-              "features": [{"type": "Feature", "id": i, "geometry": p,
-                            "properties": {}} for i, p in enumerate(polys)]}
+              "features": feats}
         with open(os.path.join(OUTDIR, "flood_extent_%dy.geojson" % T), "w",
                   encoding="utf-8") as f:
             json.dump(gj, f)
 
+        W = finfo["water_level_m"]
         scen = {"return_period_y": T, "rain_mm": R,
                 "runoff_depth_m": round(q, 4),
                 "water_level_m": round(float(W), 2),
-                "max_depth_m": round(float(depth[flooded].max()), 2),
-                "mean_depth_m": round(float(depth[flooded].mean()), 2),
+                "max_depth_m": round(float(depth[flooded].max()), 2) if flooded.any() else 0.0,
+                "mean_depth_m": round(float(depth[flooded].mean()), 2) if flooded.any() else 0.0,
                 "flooded_area_km2": round(area_km2, 3),
                 "flooded_cells": int(flooded.sum()),
-                "river_cells": int((z <= 0).sum())}
+                "river_cells": int((z <= 0).sum()),
+                "method": "multi-depression",
+                "n_pools": len(finfo["levels"]),
+                "top_pools": [{"W_m": l["W_m"], "area_cells": l["cells"],
+                               "catchment_cells": l["catchment_cells"]}
+                              for l in finfo["levels"][:3]]}
         scenarios.append(scen)
-        print("T=%3dy R=%5.1fmm -> W=%.2fm  landFlood=%.1f%%(%.3fkm2) maxD=%.2fm meanD=%.2fm"
-              % (T, R, W, 100.0 * flooded.sum() / land.sum(), area_km2,
-                 depth[flooded].max(), depth[flooded].mean()))
+        print("T=%3dy R=%5.1fmm -> Wmax=%.2fm pools=%d  landFlood=%.1f%%(%.3fkm2) maxD=%.2fm meanD=%.2fm"
+              % (T, R, W, len(finfo["levels"]), 100.0 * flooded.sum() / land.sum(), area_km2,
+                 depth[flooded].max() if flooded.any() else 0.0,
+                 depth[flooded].mean() if flooded.any() else 0.0))
 
     with open(os.path.join(OUTDIR, "scenarios.json"), "w", encoding="utf-8") as f:
         json.dump(scenarios, f, ensure_ascii=False, indent=2)

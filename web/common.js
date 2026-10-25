@@ -62,9 +62,17 @@
     });
   }
 
+  // HTML 转义(mobile.html 原实现上移共用): 接口返回/用户可控字段进 innerHTML 前必须过它
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
   global.FLOOD = {
     CFG: CFG,
     getJSON: getJSON,
+    esc: esc,
     WARN_STYLE: WARN_STYLE,
     warnLevelByArea: warnLevelByArea,
     basemapFallback: basemapFallback

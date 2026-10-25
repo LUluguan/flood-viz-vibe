@@ -43,3 +43,37 @@ def cell_area_m2(transform, lat=CELL_LAT):
 
 # ===== 水深分级直方分界(唯一权威; depth_hist/export_dashboard 共用, 下缘=淹没阈值) =====
 DEPTH_BINS = ((DEPTH_THRESH, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0), (5.0, 1e9))
+
+# ===== 广州市暴雨强度公式(中心城区/一区, 2022-12 版; 对标§四4 设计暴雨标准化) =====
+# 出处: 广州市水务局《关于公开广州市暴雨强度公式编制与设计暴雨雨型研究技术报告简本的公告》
+# (2023-03-07, swj.gz.gov.cn/gkmlpt/content/8/8835/post_8835843.html);
+# 参数转录自该公告技术报告汇总(短历时 5–180min)。q 单位 L/(s·ha), t=历时(min), P=重现期(年)。
+# 总公式: q = 13290.630 × (1 + 0.607·lgP) / (t + 39.126)^0.956
+GZ_IDF_TOTAL = {"A": 13290.630, "C": 0.607, "b": 39.126, "n": 0.956}
+# 分重现期区间参数公式(精度优于总公式, 官方推荐查用):
+#   P∈[1,10):  q = 167·A(P)/(t+b(P))^n(P),  A/P/b/n 如下
+#   P∈[10,100]: 同式(Ⅲ区参数)
+GZ_IDF_REGION_II = {   # P = 1–10 年
+    "A": lambda P: 56.414 + 21.398 * math.log(P - 0.509),
+    "b": lambda P: 24.898 + 4.496 * math.log(P - 0.836),
+    "n": lambda P: 0.934 - 0.004 * math.log(P - 0.099),
+}
+GZ_IDF_REGION_III = {  # P = 10–100 年
+    "A": lambda P: 65.165 + 21.450 * math.log(P - 4.527),
+    "b": lambda P: 32.014 + 3.805 * math.log(P - 7.842),
+    "n": lambda P: 0.921 - 0.002 * math.log(P - 0.103),
+}
+
+
+def gz_rainfall_intensity(t_min, return_period):
+    """广州中心城区暴雨强度 i(mm/min); t∈[5,180], P∈[1,100]。
+    用分区间参数公式(官方推荐), 短历时换算 i = q/167。"""
+    P = float(return_period)
+    if P < 1 or P > 100 or t_min <= 0:
+        raise ValueError("P 须在 1-100 年, t>0")
+    reg = GZ_IDF_REGION_II if P < 10 else GZ_IDF_REGION_III
+    a = reg["A"](P)
+    b = reg["b"](P)
+    n = reg["n"](P)
+    q = 167.0 * a / (t_min + b) ** n      # L/(s·ha)
+    return q / 167.0                       # mm/min

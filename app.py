@@ -14,7 +14,8 @@ app.py — 广东降雨洪涝 WebGIS 服务层(FastAPI)
   GET  /api/zone_flood?return_period=100    3×3 分区淹没占比(仅陆地)
   GET  /api/impact?return_period=100        淹没影响: 受影响建筑 + 人口(WorldPop) + 经济损失估算
   GET  /api/hotspots?return_period=100      易涝点 Top-N(按淹没面积排序)
-  GET  /api/online_sim?rain_mm=200&c=0.5    在线模拟: 自定义雨量/径流系数实时反演
+  GET  /api/online_sim?rain_mm=200&c=0.5    在线模拟: 自定义雨量/径流系数实时反演(多洼地独立水面)
+  GET  /api/hydrograph?lon=&lat=&rain_mm=   单点水淹过程线(24h 三角雨型逐时段水深序列)
   GET  /api/warning?return_period=100       分区预警等级(蓝/黄/橙/红) + 城市级预警发布
   GET  /api/evacuation?return_period=100    避难场所 + 疏散路径(A* 避水寻路)
   GET  /api/thematic_map?return_period=100  洪涝风险专题图 PNG(标题/图例/比例尺/指北针)
@@ -48,7 +49,7 @@ import rasterio
 from rasterio.windows import from_bounds
 from PIL import Image, ImageDraw
 from fastapi import FastAPI, UploadFile, File, Query, Body, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse, Response, RedirectResponse
+from fastapi.responses import JSONResponse, Response, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -86,13 +87,17 @@ DB = dict(
 )
 from pipeline_config import (DEPTH_THRESH, RUNOFF_COEF, STUDY_WS,
                             DEPTH_BINS, CELL_LAT, M_PER_DEG_LON_EQUATOR,
-                            M_PER_DEG_LAT, cell_area_m2)  # 全仓唯一权威常量
+                            M_PER_DEG_LAT, cell_area_m2, gz_rainfall_intensity,
+                            RETURNS, RETURNS_FALLBACK,
+                            LON_MIN, LAT_MIN, LON_MAX, LAT_MAX)  # 全仓唯一权威常量
 from store import (_REPORT_DIR, _load_reports, _save_reports,
                     _report_lock, _subscribers_lock, SUBSCRIBER_CAP,
                     _rate_ok, _client_ip, _clean_text,
                     _load_subscribers, _save_subscribers,
-                    _hash_pw, _load_users)
+                    _verify_pw, _upgrade_pw, _load_users,
+                    _state_quarantines)
 from flood_render import colorize   # 水深色带唯一实现(app/导出脚本共用, ARC-01)
+from flood_core import DepressionModel   # 多洼地独立水面浴缸法(唯一实现, 对标§四1)
 from rasterio.features import shapes as _rio_shapes, rasterize as _rio_rasterize
 import heapq
 from unet_apply import predict_mask
@@ -104,6 +109,23 @@ GEOSCENE_EXTENT_URL = os.environ.get("GEOSCENE_EXTENT_URL", "").strip()
 GEOSCENE_DEPTH_URL = os.environ.get("GEOSCENE_DEPTH_URL", "").strip()
 GEOSCENE_ENABLED = bool(GEOSCENE_EXTENT_URL or GEOSCENE_DEPTH_URL)
 
+# ==== 外部集成(对标§四9/10/17/21; 全部可选, 缺配置自动回退演示/规则路径) ====
+from externals import (fetch_openmeteo, llm_chat, notify_async, notify_due)
+WECOM_WEBHOOK_URL = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
+SMTP_CFG = {
+    "host": os.environ.get("SMTP_HOST", "").strip(),
+    "port": int(os.environ.get("SMTP_PORT", "465") or 465),
+    "user": os.environ.get("SMTP_USER", "").strip(),
+    "password": os.environ.get("SMTP_PASSWORD", "").strip(),
+    "use_tls": os.environ.get("SMTP_USE_TLS", "1").strip() != "0",
+}
+LLM_CFG = {
+    "api_key": os.environ.get("LLM_API_KEY", "").strip(),
+    "base_url": os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").strip(),
+    "model": os.environ.get("LLM_MODEL", "glm-4-flash").strip(),
+}
+_NOTIFY_STATE = os.path.join(ROOT, "reports", "notify_state.json")
+
 try:
     import psycopg2
 except ImportError:
@@ -114,7 +136,7 @@ _DOCS = os.environ.get("FLOOD_DOCS", "").strip() == "1"
 _state = {"db_fallbacks": 0, "scenarios_source": "file"}
 
 app = FastAPI(
-    title="广东降雨洪涝 WebGIS 服务层", version="1.3",
+    title="广东降雨洪涝 WebGIS 服务层", version="1.6",
     docs_url="/docs" if _DOCS else None,
     redoc_url=None,
     openapi_url="/openapi.json" if _DOCS else None,
@@ -227,6 +249,25 @@ def _get_dtm():
     return _dtm_m.get_or_compute("dtm", _load)
 
 
+_flood_m = _Memo()
+
+
+def _get_flood_model():
+    """缓存多洼地模型(填洼/洼地/汇水预计算一次, 任意雨量反演查表级)。返回 (model, transform)。"""
+    def _load():
+        z, transform = _get_dtm()
+        return DepressionModel(z), transform
+    return _flood_m.get_or_compute("model", _load)
+
+
+def _bathtub(z, q):
+    """多洼地独立水面浴缸法(对标§四1; 实现唯一权威 flood_core.DepressionModel)。
+    返回 (展示水位=最深洼地水面, 全域水深栅格 float32)。z 须来自 _get_dtm()。"""
+    model, transform = _get_flood_model()
+    depth, info = model.flood(q, cell_area_m2(transform))
+    return info["water_level_m"], depth
+
+
 def _load_depth_tif(return_period):
     p = os.path.join(ROOT, "flood_out", "flood_depth_%dy.tif" % return_period)
     if not os.path.exists(p):
@@ -237,18 +278,7 @@ def _load_depth_tif(return_period):
     return d
 
 
-def _bathtub(z, q):
-    """陆域体积守恒: 求 W 使陆域(z>0)平均水深 = q。hi 上限 +q 避免特大暴雨 W 越界。"""
-    land = z > 0
-    lo, hi = 0.0, float(z.max()) + q
-    for _ in range(60):
-        W = 0.5 * (lo + hi)
-        if float(np.clip(W - z[land], 0, None).mean()) < q:
-            lo = W
-        else:
-            hi = W
-    W = 0.5 * (lo + hi)
-    return W, np.clip(W - z, 0, None)
+# _bathtub 已下沉 _get_flood_model + flood_core(多洼地独立水面, 对标§四1)
 
 
 # _cell_area_m2 已上提 pipeline_config.cell_area_m2(面积换算唯一权威, ARC-01)
@@ -329,19 +359,42 @@ def _building_type(name, height):
 # 重置单价(元/m²建筑面积, 示例参数): 住宅/商办/商业综合体/公共
 UNIT_COST = {"住宅": 8500, "商办": 10000, "商业综合体": 12000, "公共": 7000}
 
+# 水深-损失率曲线族(对标§四15): loss_curve=demo 为项目原设示例参数(所有类型同曲线);
+# loss_curve=hazus 数值取自 USACE IWR/HAZUS "单层住宅无地下室"均值 depth-damage 曲线
+# (RES1: 1ft≈9%/2ft≈16%/3ft≈23%/4ft≈31%/5ft≈38%, 经 Al Assi et al. 2023 等文献刊载,
+# 见 FEMA Hazus Flood Model Technical Manual 曲线目录; 6–8ft(45/51/56%)为同一曲线
+# 文献常引续段, 引用需按 FEMA 手册复核; 超出表列深水段按末段饱和处理=保守)。
+# 诚实限制: 公开数值仅 RES1 住宅曲线, 商办/商业/公共未分曲线校准(同曲线近似),
+# 高层建筑的损失率会被低估。
+_HAZUS_CURVE_PTS = [(d * 0.3048, v) for d, v in
+                    [(0.0, 0.0), (1, 0.09), (2, 0.16), (3, 0.23), (4, 0.31), (5, 0.38),
+                     (6, 0.45), (7, 0.51), (8, 0.56)]]
 
-def _loss_rate(depth_m):
-    """水深-损失率曲线(示例参数): 0.05m 起损, 2m 以上趋于饱和(0.85)。"""
+
+def _interp_curve(pts, x):
+    """分段线性插值(超出右端取饱和值)。"""
+    if x <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def _loss_rate(depth_m, btype="住宅", curve="demo"):
+    """水深-损失率(curve=demo 项目示例单曲线 / hazus USACE-RES1 官方数值曲线, 各类型同曲线近似)。"""
     if depth_m <= DEPTH_THRESH:
         return 0.0
+    if curve == "hazus":
+        return round(min(0.85, _interp_curve(_HAZUS_CURVE_PTS, depth_m)), 3)
     return round(min(0.85, 0.10 + 0.28 * depth_m + 0.04 * depth_m * depth_m), 3)
 
 
-def _building_loss(b, depth_m):
+def _building_loss(b, depth_m, curve="demo"):
     """单栋建筑直接经济损失(万元) = 重置价值 × 损失率。重置价值 = 底面积×层数×单价。"""
     floors = max(1, round(b["height_m"] / 3.2)) if b["height_m"] > 0 else 6
     value = b["area_m2"] * floors * UNIT_COST.get(b["btype"], 8500)
-    return value * _loss_rate(depth_m) / 1e4
+    return value * _loss_rate(depth_m, b["btype"], curve) / 1e4
 
 
 def _get_pop():
@@ -372,8 +425,10 @@ def _sample_grid(arr, transform, lon, lat):
     return None
 
 
-def impact_stats(depth, transform):
+def impact_stats(depth, transform, loss_curve="demo"):
     """受影响建筑(质心处水深>0.05m)与受影响人口。
+
+    loss_curve: 损失率曲线族(见 _loss_rate); demo=项目示例参数, hazus=HAZUS 式分类型示意曲线。
 
     人口口径: 优先用 WorldPop 100m 人口格网(pipeline/fetch_pop.py 产出 dem/study_pop.tif,
     掩膜内人口加和); 格网缺失时按天河区常住人口密度均摊估算——
@@ -389,7 +444,7 @@ def impact_stats(depth, transform):
     for b in blds:
         d = _sample_grid(d_land, transform, b["lon"], b["lat"])
         if d is not None and d > DEPTH_THRESH:
-            loss_wan = _building_loss(b, d)
+            loss_wan = _building_loss(b, d, loss_curve)
             loss_total_wan += loss_wan
             loss_by_type[b["btype"]] = loss_by_type.get(b["btype"], 0.0) + loss_wan
             affected.append({"name": b["name"], "depth_m": round(d, 2),
@@ -412,7 +467,11 @@ def impact_stats(depth, transform):
         "pop_source": pop_src,
         "estimated_loss_wan": round(loss_total_wan, 1),
         "loss_by_type_wan": {k: round(v, 1) for k, v in loss_by_type.items()},
-        "loss_note": "直接经济损失估算: 底面积×层数×重置单价×水深损失率曲线(示例参数, 仅建筑直接损失)",
+        "loss_curve": loss_curve,
+        "loss_note": "直接经济损失估算: 底面积×层数×重置单价×水深损失率曲线"
+                     "(%s)" % ("USACE/HAZUS RES1 单层无地下室均值曲线(1ft≈9%…5ft≈38%, 文献刊载; "
+                               "各建筑类型未分曲线校准属示意近似, 高层损失率会被低估)" if loss_curve == "hazus"
+                               else "项目示例参数"),
     }
 
 
@@ -438,7 +497,7 @@ def hotspot_stats(flood_mask, depth, transform, top=8):
         return _ring_area_km2(ring, sum(lats) / len(lats))
     geoms.sort(key=poly_km2, reverse=True)
     items = []
-    for g, v in geoms[:max(top * 3, 12)]:
+    for g, _v in geoms[:max(top * 3, 12)]:
         ring = g["coordinates"][0]
         lons = [pt[0] for pt in ring]
         lats = [pt[1] for pt in ring]
@@ -506,9 +565,9 @@ def _db_reachable():
 def health():
     """运行状态: 版本/DB 可达性/数据源策略/关键产物存在性/缓存观测/降级计数。
     DB 降级不再无声——这里能看出 scenarios 走的是库还是文件。"""
-    memos = {"dtm": _dtm_m, "png": _png_m, "hist": _hist_m, "zone": _zone_m,
-             "hotspot": _hotspot_m, "bld": _bld_m, "pop": _pop_m, "unc": _unc_m,
-             "evac": _evac_m}
+    memos = {"dtm": _dtm_m, "flood_model": _flood_m, "png": _png_m, "hist": _hist_m,
+             "zone": _zone_m, "hotspot": _hotspot_m, "bld": _bld_m, "pop": _pop_m,
+             "unc": _unc_m, "evac": _evac_m}
     hits = sum(m.stats()[0] for m in memos.values())
     misses = sum(m.stats()[1] for m in memos.values())
     return {
@@ -516,7 +575,7 @@ def health():
         "db_reachable": _db_reachable(), "db_first": _db_first(),
         "scenarios_source": _state.get("scenarios_source", "file"),
         "db_fallbacks": _state.get("db_fallbacks", 0),
-        "store_quarantines": _state.get("store_quarantines", 0),
+        "store_quarantines": _state_quarantines[0],
         "artifacts": {
             "design_storm_24h": _artifact(os.path.join("flood_out", "design_storm_24h.json")),
             "flood_tiles": _artifact(os.path.join("flood_out", "flood_tiles", "meta.json")),
@@ -562,7 +621,7 @@ def scenarios():
                                       max_depth_m, mean_depth_m, flooded_area_km2, flooded_cells, river_cells
                                FROM flood_scenarios ORDER BY return_period_y""")
                 cols = [d[0] for d in cur.description]
-                base = [dict(zip(cols, r)) for r in cur.fetchall()]
+                base = [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
                 source = "postgis"
         except Exception as e:
             _log.warning("PostGIS flood_scenarios 查询失败, 回退本地文件: %s", e)
@@ -641,7 +700,7 @@ def monthly_rain():
         return _monthly_cache
     years = [2021, 2022, 2023, 2024, 2025]  # 降雨年份(与 RETURNS 重现期档位无关)
     out = {}
-    for yr, p in zip(years, paths):
+    for yr, p in zip(years, paths, strict=False):
         if not os.path.exists(p):
             _monthly_cache = None
             return {"years": [], "months": [], "monthly_rain": {},
@@ -695,11 +754,13 @@ def zone_flood(d=Depends(_depth_or_404), return_period: int = Query(100, ge=2, l
 
 
 @app.get("/api/impact", tags=["影响分析"])
-def impact(d=Depends(_depth_or_404), return_period: int = Query(100, ge=2, le=100)):
+def impact(d=Depends(_depth_or_404), return_period: int = Query(100, ge=2, le=100),
+           loss_curve: str = Query("demo", pattern="^(demo|hazus)$",
+                                   description="损失率曲线: demo=示例参数 / hazus=HAZUS式分类型示意")):
     """淹没影响统计: 受影响建筑(质心处水深>0.05m, Top5 列出最深)与受影响人口(WorldPop)。"""
     try:
         _, transform = _get_dtm()
-        return {"return_period": return_period, **impact_stats(d, transform)}
+        return {"return_period": return_period, **impact_stats(d, transform, loss_curve)}
     except RuntimeError as e:
         # 仅数据缺失类配置错误回 404(消息为仓库自有文案, 非内部异常原文)
         return JSONResponse({"error": str(e)}, status_code=404)
@@ -752,49 +813,123 @@ def critical_assets(d=Depends(_depth_or_404), return_period: int = Query(100, ge
             "assets": items}
 
 
-def _online_sim_core(rain_mm, c, top=5):
-    """在线模拟核心逻辑(供端点与问答复用; 参数须为普通数值)。"""
-    z, transform = _get_dtm()
+def _online_sim_core(rain_mm, c, top=5, drain_mm=0.0):
+    """在线模拟核心逻辑(供端点与问答复用; 参数须为普通数值)。
+    多洼地独立水面(对标§四1): 每个淹没多边形携带自身水面 W(properties.W),
+    前端按斑块独立挤出水面; water_level_m 为最深洼地水面(展示口径)。
+    drain_mm: 排水折减(mm/24h, 对标§四2/§四14)——泵站强排/管网改造的工程方案预演。"""
+    model, transform = _get_flood_model()
+    z = model.z.astype("float32")
     q = rain_mm / 1000.0 * c
-    W, depth = _bathtub(z, q)
+    depth, finfo = model.flood(q, cell_area_m2(transform), drain_depth_m=drain_mm / 1000.0)
+    W = finfo["water_level_m"]
     land = z > 0
     flooded = (depth > DEPTH_THRESH) & land
+    dep_lab2d = model._dep_lab.reshape(z.shape)
     feats = []
-    if flooded.any():
-        for g, v in _rio_shapes(flooded.astype("uint8"), mask=flooded, transform=transform):
+    for l in finfo["levels"]:
+        m = flooded & (dep_lab2d == l["dep"])
+        if not m.any():
+            continue
+        for g, v in _rio_shapes(m.astype("uint8"), mask=m, transform=transform):
             if v == 1:
-                feats.append({"type": "Feature", "geometry": g, "properties": {}})
+                feats.append({"type": "Feature", "geometry": g,
+                              "properties": {"W": round(float(l["W_m"]), 2)}})
     area = cell_area_m2(transform)
     return {
-        "rain_mm": rain_mm, "c": round(c, 2),
+        "rain_mm": rain_mm, "c": round(c, 2), "drain_mm": round(drain_mm, 1),
         "water_level_m": round(float(W), 2),
         "runoff_depth_m": round(q, 4),
         "mean_depth_m": round(float(depth[flooded].mean()), 2) if flooded.any() else 0.0,
         "max_depth_m": round(float(depth[flooded].max()), 2) if flooded.any() else 0.0,
         "flooded_area_km2": round(float(flooded.sum() * area) / 1e6, 3),
         "flooded_cells": int(flooded.sum()),
+        "n_pools": len(finfo["levels"]),
         "zones": _zone_ratios(z, depth, 3),
         "impact": impact_stats(depth, transform),
         "hotspots": hotspot_stats(flooded, depth, transform, top),
         "extent": {"type": "FeatureCollection", "features": feats},
-        "note": "浴缸法实时反演(默认 c=0.5 与重现期场景同口径; 自定义 c 为情景假设)",
+        "note": "多洼地独立水面反演(默认 c=0.5 与重现期场景同口径; drain_mm 为排水工程折减)",
     }
 
 
 @app.get("/api/online_sim", tags=["在线模拟"])
-def online_sim(rain_mm: float = Query(..., gt=0, le=2000),
+def online_sim(request: Request,
+               rain_mm: float = Query(..., gt=0, le=2000),
                c: float = Query(RUNOFF_COEF, ge=0.05, le=0.95),
-               top: int = Query(5, ge=1, le=20)):
+               top: int = Query(5, ge=1, le=20),
+               drain_mm: float = Query(0, ge=0, le=60,
+                                       description="排水系统 24h 折减能力(mm), 工程方案预演")):
     """在线模拟: 输入 24h 雨量(mm)与综合径流系数 c(0.05-0.95, 海绵城市改造可降低 c)
-    → 浴缸法实时反演水位/淹没范围/分区占比/影响统计/易涝点。默认 c 与重现期场景同口径。"""
+    → 多洼地独立水面实时反演水位/淹没范围/分区占比/影响统计/易涝点。
+    drain_mm>0 演示工程调度预案(泵站/管网折减, 对标§四14)。默认 c 与重现期场景同口径。
+    同步 def(FastAPI 自动进线程池); 全图反演是重计算 → 30 次/分钟频控(24h 演进动画 8 步不受限)。"""
+    if not _rate_ok("sim:" + _client_ip(request), limit=30, window=60.0):
+        return JSONResponse({"error": "请求过于频繁, 请稍后再试"}, status_code=429)
     try:
-        return _online_sim_core(rain_mm, c, top)
+        return _online_sim_core(rain_mm, c, top, drain_mm=drain_mm)
     except RuntimeError as e:
         # 仅数据缺失类配置错误回 404(消息为仓库自有文案, 非内部异常原文)
         return JSONResponse({"error": str(e)}, status_code=404)
     except Exception:
         _log.exception("%s 内部错误(真实缺陷, 按 500 上报排查)", "online_sim")
         return JSONResponse({"error": "服务内部错误, 请联系维护者查看日志"}, status_code=500)
+
+
+def _hydrograph_core(lon, lat, rain_mm, c):
+    """单点过程线核心(端点与 LLM 工具共用)。
+    24h 三角形设计雨型(峰现系数 0.4, 与前端演进动画同口径) → 16 档累积径流
+    → 多洼地反演 → 采样点水深序列。体积守恒模型无出流, 序列为单调涨水段。"""
+    model, transform = _get_flood_model()
+    z = model.z.astype("float32")
+    zg = _sample_grid(z, transform, lon, lat)
+    if zg is None or zg <= 0:
+        return {"error": "该点不在研究区陆域范围内"}
+    r, K = 0.4, 16
+
+    def tri_cum(x):                      # 三角雨型累积比例(解析式, 总量归一)
+        return x * x / r if x <= r else r + 2 * (x - r) - (x - r) ** 2 / (1 - r)
+
+    area_m2 = cell_area_m2(transform)
+    series, onset_t, peak = [], None, 0.0
+    for k in range(1, K + 1):
+        x = k / K
+        cum_mm = rain_mm * tri_cum(x)
+        depth, finfo = model.flood(cum_mm / 1000.0 * c, area_m2)
+        dv = _sample_grid(depth, transform, lon, lat) or 0.0
+        if onset_t is None and dv > DEPTH_THRESH:
+            onset_t = round(x * 24, 1)
+        peak = max(peak, dv)
+        series.append({"t_h": round(x * 24, 1), "rain_cum_mm": round(cum_mm, 1),
+                       "depth_m": round(dv, 3),
+                       "W_m": finfo["water_level_m"]})
+    return {"lon": lon, "lat": lat, "rain_mm": rain_mm, "c": c,
+            "ground_m": round(float(zg), 2),
+            "onset_t_h": onset_t, "peak_depth_m": round(peak, 3),
+            "flooded": peak > DEPTH_THRESH,
+            "series": series,
+            "note": "三角形设计雨型(峰现系数0.4)+多洼地体积守恒反演; 单调涨水段(无退水过程)"}
+
+
+@app.get("/api/hydrograph", tags=["在线模拟"])
+def hydrograph(request: Request,
+               lon: float = Query(..., ge=113.0, le=114.0),
+               lat: float = Query(..., ge=22.5, le=23.8),
+               rain_mm: float = Query(200, gt=0, le=2000),
+               c: float = Query(RUNOFF_COEF, ge=0.05, le=0.95)):
+    """单点水淹过程线(对标§四13): 24h 三角形设计雨型(峰现系数 0.4, 与前端演进动画同口径)
+    → 逐时段累积径流 → 多洼地反演 → 采样点"何时开始淹/水深过程"时间序列。
+    体积守恒模型无出流过程, 序列为单调涨水段(退水需水动力/管网出流, 见路线图);
+    未淹点 onset/peak 为 null。与 /api/online_sim 共享频控(每次 16 档反演, 查表级)。"""
+    if not _rate_ok("sim:" + _client_ip(request), limit=30, window=60.0):
+        return JSONResponse({"error": "请求过于频繁, 请稍后再试"}, status_code=429)
+    try:
+        out = _hydrograph_core(lon, lat, rain_mm, c)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    if "error" in out:
+        return JSONResponse(out, status_code=400)
+    return out
 
 
 @app.get("/api/realevent", tags=["真实事件"])
@@ -913,6 +1048,19 @@ def predict(request: Request, file: UploadFile = File(...)):
 _tokens = {}   # token -> {username, role, ts}
 
 
+def _gc_tokens():
+    """过期 token 清扫(2026-10 审计 BE-02: 旧实现只在"本人再次携带"时删除, 只增不减)。
+    登录时顺带触发: 先清 12h 过期项, 仍超硬上限则按插入序截断最旧。"""
+    if len(_tokens) < 512:
+        return
+    now = time.time()
+    for k in [k for k, v in _tokens.items() if now - v["ts"] > 12 * 3600]:
+        _tokens.pop(k, None)
+    if len(_tokens) > 4096:                       # 硬上限(防脚本循环登录撑内存)
+        for k in sorted(_tokens, key=lambda k: _tokens[k]["ts"])[:len(_tokens) - 4096]:
+            _tokens.pop(k, None)
+
+
 def _current_user(req_token):
     if not req_token:
         return None
@@ -949,11 +1097,17 @@ def _token_from(request, query_token):
 def auth_login(request: Request, payload: dict = Body(...)):
     uname = str(payload.get("username", "")).strip()
     pw = str(payload.get("password", ""))
-    # 爆破防护(SEC-02: 实测 60 次错口令无一 429): IP+用户名双键滑窗限流, 5 次/分钟
+    # 爆破防护(SEC-02): IP+用户名双键滑窗限流 5 次/分钟;
+    # 叠加纯 IP 维度 30 次/分钟(2026-10 审计 BE-05: 轮换用户名的口令喷洒可绕过双键)
     if not _rate_ok("login:%s|%s" % (_client_ip(request), uname[:40]), limit=5, window=60.0):
         return JSONResponse({"error": "尝试过于频繁, 请 1 分钟后再试"}, status_code=429)
-    for u in _load_users():
-        if u["username"] == uname and u["hash"] == _hash_pw(pw, u["salt"]):
+    if not _rate_ok("login_ip:" + _client_ip(request), limit=30, window=60.0):
+        return JSONResponse({"error": "尝试过于频繁, 请 1 分钟后再试"}, status_code=429)
+    users = _load_users()
+    for i, u in enumerate(users):
+        if u["username"] == uname and _verify_pw(pw, u):
+            _upgrade_pw(users, i, pw)   # 旧 sha256 单轮哈希 → PBKDF2(登录即升级, 幂等)
+            _gc_tokens()
             tok = uuid.uuid4().hex
             _tokens[tok] = {"username": uname, "role": u["role"], "ts": time.time()}
             exp = (datetime.datetime.now() + datetime.timedelta(hours=12)).strftime("%Y-%m-%d %H:%M")
@@ -1070,16 +1224,30 @@ def warning(return_period: int = Query(100, ge=2, le=100)):
         w = _compute_warning(_get_dtm()[0], d, "%d年一遇" % return_period)
         _warn_cache[key] = w
         w = dict(w)
-    # 订阅触达统计(参考 Flood Hub Email Subscriptions; 演示环境模拟"推送链路已通")
+    # 订阅触达(参考 Flood Hub Email Subscriptions): 橙/红预警触发
+    # 2026-10 对标§四21: 配置 WECOM_WEBHOOK_URL / SMTP_* 后真实发送(企业微信+邮件),
+    # 同"情景+等级"30 分钟冷却去重; 未配置时保持原演示统计口径, 后台发送不阻塞响应
     if _WARN_RANK.get(w.get("city_level", "无"), 0) >= 2:
-        w["notify"] = {"subscribers": len(_load_subscribers()),
-                       "channel": "邮件(演示登记, 未真实发送)",
-                       "note": "橙/红预警触发订阅触达; 正式业务接入短信/邮件网关"}
+        subs = _load_subscribers()
+        w["notify"] = {"subscribers": len(subs),
+                       "channel": ("企业微信+邮件" if (WECOM_WEBHOOK_URL or SMTP_CFG["host"]) else "邮件(演示登记, 未真实发送)"),
+                       "note": "橙/红预警触发订阅触达; 正式业务接入短信网关"}
+        if (WECOM_WEBHOOK_URL or SMTP_CFG["host"]) and \
+                notify_due(_NOTIFY_STATE, "T%s:%s" % (return_period, w["city_level"])):
+            zone_txt = "; ".join("区%d(%s %.0f%%)" % (z0["zone"], z0["level"], z0["ratio_pct"])
+                                 for z0 in w["zones"] if z0["level"] != "无") or "各区均低于蓝色阈值"
+            md = ("**洪涝预警(%s)**\n> 珠江新城 %s\n> 淹没面积 **%.2f km²**\n> 建议: %s\n> 高风险分区: %s"
+                  % (w["city_level"], w["scenario"], w["flooded_area_km2"], w["advice"], zone_txt))
+            body = ("珠江新城 %s 洪涝预警\n等级: %s\n淹没面积: %.2f km²\n建议: %s\n高风险分区: %s"
+                    % (w["scenario"], w["city_level"], w["flooded_area_km2"], w["advice"], zone_txt))
+            notify_async(WECOM_WEBHOOK_URL, SMTP_CFG,
+                         "[C2132预警] %s %s预警" % (w["scenario"], w["city_level"]),
+                         md, body, [s["email"] for s in subs])
+            w["notify"]["sent"] = True
     return w
 
 
 # ==== 避难场所 + 疏散路径(A* 避水寻路) ====
-_evac_cache = {}
 _SHELTER_KEYS = PUBLIC_KEYS
 
 
@@ -1421,23 +1589,17 @@ def _theme_hillshade(z, mw, mh):
     return Image.fromarray((shade_small * 255).astype("uint8"), "L").resize((mw, mh), Image.BILINEAR).convert("RGB")
 
 
-def _theme_blend(px, shade_img, flood_rgb, rows, cols, mw, mh, map_l, map_t):
-    """淹没着色与地形晕渲合成: 有淹没以淹没色为主(留 15% 地形明暗), 其余为晕渲底色。"""
-    fl_img = Image.fromarray(flood_rgb, "RGB").resize((mw, mh), Image.NEAREST)
-    shade_px, fl_px = shade_img.load(), fl_img.load()
-    for yy in range(mh):
-        for xx in range(mw):
-            fr, fg, fb = fl_px[xx, yy]
-            if fr or fg or fb:
-                sr = shade_px[xx, yy][0] / 255.0
-                px[map_l + xx, map_t + yy] = (int(fr * (0.85 + 0.15 * sr)),
-                                              int(fg * (0.85 + 0.15 * sr)),
-                                              int(fb * (0.85 + 0.15 * sr)))
-            else:
-                s = shade_px[xx, yy]
-                px[map_l + xx, map_t + yy] = (int(s[0] * 0.30 + 0.70 * 226),
-                                              int(s[1] * 0.30 + 0.70 * 233),
-                                              int(s[2] * 0.30 + 0.70 * 240))
+def _theme_blend(img, shade_img, flood_rgb, mw, mh, map_l, map_t):
+    """淹没着色与地形晕渲合成: 有淹没以淹没色为主(留 15% 地形明暗), 其余为晕渲底色。
+    numpy 向量化(2026-10 审计 BE-09/对标§四18; 原逐像素 Python 双循环 85.5 万格/次)。"""
+    fl = np.asarray(Image.fromarray(flood_rgb, "RGB").resize((mw, mh), Image.NEAREST),
+                    dtype=np.float32)
+    sr = np.asarray(shade_img, dtype=np.float32)[..., 0] / 255.0   # 原实现取晕渲 R 通道明暗
+    wet = fl.any(axis=2)
+    dry = sr[..., None] * 0.30 + np.array([226.0, 233.0, 240.0], dtype=np.float32) * 0.70
+    wetv = fl * (0.85 + 0.15 * sr[..., None])
+    out = np.where(wet[..., None], wetv, dry).astype("uint8")
+    img.paste(Image.fromarray(out, "RGB"), (map_l, map_t))
 
 
 def _theme_grid_and_frame(draw, map_l, map_t, map_r, map_b, mw, mh):
@@ -1524,7 +1686,7 @@ def _theme_legend(draw, lx, map_t, product, legend_items, haz_counts, fac_floode
         draw.text((lx, yy), "分级像元数 / 面积估算", font=f_sm, fill="#627d98")
         yy += 22
         cell_km2 = cell_area_m2(transform) / 1e6
-        for (col, lbl), cnt in zip(legend_items, haz_counts):
+        for (_col, lbl), cnt in zip(legend_items, haz_counts, strict=False):
             draw.text((lx, yy), "%s: %d 格 ≈ %.3f km²" % (lbl.split("·")[0], cnt,
                       cnt * cell_km2),
                       font=f_sm, fill="#334e68")
@@ -1554,12 +1716,11 @@ def _theme_map_png(return_period, title, product, d, z, transform):
     MAP_L, MAP_T, MAP_R, MAP_B = 70, 110, 1180, 880
     mw, mh = MAP_R - MAP_L, MAP_B - MAP_T
     img = Image.new("RGB", (W, H), "#f5f7fa")
-    px = img.load()
     draw = ImageDraw.Draw(img)
     flood_rgb, _flood_any, legend_items, haz_counts, fac_flooded = _theme_product_layers(
         d, z, transform, product)
     shade_img = _theme_hillshade(z, mw, mh)
-    _theme_blend(px, shade_img, flood_rgb, rows, cols, mw, mh, MAP_L, MAP_T)
+    _theme_blend(img, shade_img, flood_rgb, mw, mh, MAP_L, MAP_T)
     _theme_grid_and_frame(draw, MAP_L, MAP_T, MAP_R, MAP_B, mw, mh)
     f_med = _load_cjk_font(15)
     f_sm = _load_cjk_font(12)
@@ -1594,14 +1755,64 @@ def thematic_map(return_period: int = Query(100, ge=2, le=100),
     return Response(content=png, media_type="image/png")
 
 
-# ==== 实时雨情(演示数据: 每10分钟一个确定性情景, 可替换为真实气象接口) ====
+# ==== 实时雨情: Open-Meteo 实况(近24h)+预报(未来72h); 失败回退演示情景 ====
 _STATIONS = [("猎德大道站", 113.3230, 23.1125), ("花城大道站", 113.3295, 23.1170),
              ("珠江公园站", 113.3355, 23.1195), ("海心沙站", 113.3180, 23.1095),
              ("员村站", 113.3420, 23.1135)]
 
 
+def _om_now_index(om):
+    """Open-Meteo 返回含 past_days 历史 + forecast_days 未来; 以当前整点定位分界。"""
+    now_key = datetime.datetime.now().strftime("%Y-%m-%dT%H:00")
+    idx = len(om["times"]) - 1
+    for i, t in enumerate(om["times"]):
+        if t >= now_key:
+            idx = i
+            break
+    return idx
+
+
+def _realtime_rain_payload(om):
+    """由 Open-Meteo 小时序列构造响应(站点值 = 格点值 + 确定性空间扰动, 见 note)。"""
+    idx = _om_now_index(om)
+    past = om["precip"][max(0, idx - 23):idx + 1]      # 近24h(含当前时次)
+    last1 = past[-1] if past else 0.0
+    stations = []
+    for k, (name, lon, lat) in enumerate(_STATIONS):
+        jitter = 1.0 + 0.10 * math.sin(k * 2.1 + lon * 137)   # 站点确定性扰动 ±10%
+        h1 = min(60.0, max(0.0, last1 * jitter))
+        acc = min(200.0, max(0.0, sum(past) * jitter))
+        stations.append({"name": name, "lon": lon, "lat": lat,
+                         "hour_rain_mm": round(h1, 1), "rain24h_mm": round(acc, 1)})
+    trend = [{"hour": (datetime.datetime.now() - datetime.timedelta(hours=11 - i)).strftime("%H:%M"),
+              "mm": round(v, 1)} for i, v in enumerate(past[-12:])]
+    if last1 >= 16:
+        level, advice = "暴雨", "注意城区积涝"
+    elif last1 >= 8:
+        level, advice = "大雨", "出行请避开易涝路段"
+    elif last1 >= 2.5:
+        level, advice = "中雨", "降雨持续, 关注预警"
+    elif last1 >= 0.1:
+        level, advice = "小雨", "无积涝风险"
+    else:
+        level, advice = "无雨", "天气平静"
+    return {"updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "slot_minutes": 10,
+            "city_hour_rain_mm": round(last1, 1),
+            "city_rain24h_mm": round(sum(past), 1),
+            "intensity_level": level, "advice": advice,
+            "stations": stations, "trend_12h": trend,
+            "forecast_note": "未来降雨见 /api/forecast_flood(Open-Meteo 预报驱动)",
+            "note": "Open-Meteo 实况(研究区格点, 站点值为确定性扰动 ±10%); 免费接口无key"}
+
+
 @app.get("/api/realtime_rain", tags=["实时雨情"])
 def realtime_rain():
+    """实时雨情(对标§四9): 优先 Open-Meteo 实况(近24h 逐时降雨→强度分级/站点卡/12h趋势);
+    外网不可用或接口失败时回退确定性演示情景(每10分钟一情景), 服务永不因外网 5xx。"""
+    om = fetch_openmeteo(past_days=1, forecast_days=3)
+    if om is not None:
+        return _realtime_rain_payload(om)
     slot = int(time.time() // 600)
     rng = random.Random(slot * 7919)
     # 过去24h逐时雨量: 30%概率处于一场降雨过程中(前强后弱), 否则平稳
@@ -1638,20 +1849,229 @@ def realtime_rain():
             "city_rain24h_mm": round(sum(hours), 1),
             "intensity_level": level, "advice": advice,
             "stations": stations, "trend_12h": trend,
-            "note": "演示数据: 每10分钟生成一次确定性雨情情景(模拟实时接入), 未连接真实气象接口。"}
+            "note": "Open-Meteo 不可用, 已回退演示数据: 每10分钟一个确定性雨情情景"}
 
 
-# ==== 防汛智能问答(本地意图解析, 离线可用; 输出结构化数据供前端联动三维) ====
+@app.get("/api/forecast_flood", tags=["实时雨情"])
+def forecast_flood(request: Request, c: float = Query(RUNOFF_COEF, ge=0.05, le=0.95)):
+    """天气预报驱动的内涝风险推演(对标§四10, Google Flood Hub 模式):
+    Open-Meteo(底层 GFS/ICON)未来 72h 逐时降雨 → 6/12/24/48/72h 累计径流
+    → 多洼地反演 → 各时距淹没面积/水位/城市预警等级时间线; 附最恶劣时距的淹没
+    多边形供三维直接上图。接口失败回 503 并说明(预报无演示兜底: 假预报比没预报更糟)。"""
+    if not _rate_ok("fc:" + _client_ip(request), limit=10, window=60.0):
+        return JSONResponse({"error": "请求过于频繁, 请稍后再试"}, status_code=429)
+    om = fetch_openmeteo(past_days=0, forecast_days=3)
+    if om is None:
+        return JSONResponse({"error": "降雨预报源(Open-Meteo)当前不可用, 请稍后重试"}, status_code=503)
+    idx = _om_now_index(om)
+    fut = om["precip"][idx + 1:]                     # 未来逐时(不含当前时次)
+    if len(fut) < 48:
+        return JSONResponse({"error": "预报序列过短"}, status_code=503)
+    model, transform = _get_flood_model()
+    z = model.z.astype("float32")
+    land = z > 0
+    area = cell_area_m2(transform)
+    dep_lab2d = model._dep_lab.reshape(z.shape)
+    series, worst = [], None
+    for h in (6, 12, 24, 48, 72):
+        cum_mm = sum(fut[:h])
+        depth, finfo = model.flood(cum_mm / 1000.0 * c, area)
+        flooded = (depth > DEPTH_THRESH) & land
+        km2 = round(float(flooded.sum() * area) / 1e6, 3)
+        lv = _city_level_by_area(km2)
+        series.append({"t_h": h, "rain_cum_mm": round(cum_mm, 1),
+                       "flooded_area_km2": km2,
+                       "water_level_m": round(float(finfo["water_level_m"]), 2),
+                       "city_level": lv})
+        if worst is None or km2 > worst["flooded_area_km2"]:
+            worst = {"t_h": h, "flooded_area_km2": km2, "flooded": flooded,
+                     "depth": depth, "levels": finfo["levels"]}
+    feats = []
+    for l in worst["levels"]:
+        m = worst["flooded"] & (dep_lab2d == l["dep"])
+        if not m.any():
+            continue
+        for g, v in _rio_shapes(m.astype("uint8"), mask=m, transform=transform):
+            if v == 1:
+                feats.append({"type": "Feature", "geometry": g,
+                              "properties": {"W": round(float(l["W_m"]), 2)}})
+    return {"source": "open-meteo(GFS/ICON) 72h 逐时降雨预报", "c": round(c, 2),
+            "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "series": series,
+            "worst_t_h": worst["t_h"],
+            "extent": {"type": "FeatureCollection", "features": feats},
+            "note": "预报→累计径流→多洼地反演; 降雨预报本身有不确定性, 供趋势参考"}
+
+
+# ==== 防汛智能问答: LLM function-calling(对标§四17)优先, 规则引擎兜底 ====
 def _fmt_pop(n):
     return ("%.1f 万人" % (n / 10000)) if n >= 10000 else ("%d 人" % n)
 
 
+_LLM_SYSTEM = (
+    "你是城市洪涝防汛助手, 服务于广州珠江新城 WebGIS 平台(多洼地浴缸法淹没模型)。"
+    "回答前必须调用工具获取真实数据, 禁止编造数值; 用简体中文、60-150字、直接给结论与建议。"
+    "用户未指定重现期时, 情景/预警/影响/疏散类工具一律用 return_period=100(最高档)。"
+    "可用能力: 重现期情景(2/5/10/50/100年)、在线模拟(雨量mm/径流系数/排水折减)、"
+    "预警等级、易涝点、影响统计(建筑/人口/损失)、疏散路径、单点水淹过程线、实时雨情、72h预报。"
+    "若用户问题与防汛无关, 礼貌拉回。"
+)
+
+_LLM_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_scenario", "description": "按重现期(年)获取设计暴雨与淹没统计",
+        "parameters": {"type": "object", "properties": {
+            "return_period": {"type": "integer", "enum": [2, 5, 10, 50, 100]}},
+            "required": ["return_period"]}}},
+    {"type": "function", "function": {
+        "name": "run_sim", "description": "在线淹没模拟: 24h雨量mm、径流系数c、排水折减mm(工程预案)",
+        "parameters": {"type": "object", "properties": {
+            "rain_mm": {"type": "number"}, "c": {"type": "number"},
+            "drain_mm": {"type": "number"}}, "required": ["rain_mm"]}}},
+    {"type": "function", "function": {
+        "name": "get_warning", "description": "按重现期获取分级预警(蓝/黄/橙/红)与建议",
+        "parameters": {"type": "object", "properties": {
+            "return_period": {"type": "integer"}}, "required": ["return_period"]}}},
+    {"type": "function", "function": {
+        "name": "get_hotspots", "description": "获取易涝点Top-N(面积/水深/坐标)",
+        "parameters": {"type": "object", "properties": {"top": {"type": "integer"}}}}},
+    {"type": "function", "function": {
+        "name": "get_impact", "description": "按重现期获取受影响建筑/人口/经济损失",
+        "parameters": {"type": "object", "properties": {
+            "return_period": {"type": "integer"}}, "required": ["return_period"]}}},
+    {"type": "function", "function": {
+        "name": "get_evacuation", "description": "按重现期获取避难场所与疏散路径",
+        "parameters": {"type": "object", "properties": {
+            "return_period": {"type": "integer"}}, "required": ["return_period"]}}},
+    {"type": "function", "function": {
+        "name": "get_hydrograph", "description": "单点24h水淹过程线(何时开始淹/峰值水深)",
+        "parameters": {"type": "object", "properties": {
+            "lon": {"type": "number"}, "lat": {"type": "number"},
+            "rain_mm": {"type": "number"}}, "required": ["lon", "lat"]}}},
+    {"type": "function", "function": {
+        "name": "get_realtime", "description": "获取研究区实时雨情(近24h实况)",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "get_forecast", "description": "获取未来72h降雨预报驱动的内涝风险时间线",
+        "parameters": {"type": "object", "properties": {
+            "c": {"type": "number"}}}}},
+]
+
+
+def _llm_tool_exec(name, args):
+    """工具执行器: 全部走本地函数, 不出网(雨情/预报除外), 结果裁剪防超长。"""
+    try:
+        if name == "get_scenario":
+            T = int(args.get("return_period", 100))
+            p = os.path.join(ROOT, "flood_out", "scenarios.json")
+            if not os.path.exists(p):
+                return {"error": "无情景数据"}
+            with open(p, encoding="utf-8") as f:
+                ss = json.load(f)
+            return next((s for s in ss if s.get("return_period_y") == T), {"error": "无该档位"})
+        if name == "run_sim":
+            d = _online_sim_core(float(args["rain_mm"]), float(args.get("c", 0.5)),
+                                 top=3, drain_mm=float(args.get("drain_mm", 0) or 0))
+            im = d["impact"]
+            return {k: d[k] for k in ("rain_mm", "c", "drain_mm", "water_level_m",
+                                      "flooded_area_km2", "max_depth_m", "mean_depth_m", "n_pools")} | {
+                "affected_buildings": im["affected_buildings"], "buildings_total": im["buildings_total"],
+                "affected_population": im["affected_population"],
+                "estimated_loss_wan": im["estimated_loss_wan"],
+                "top_hotspots": [{"lon": h["lon"], "lat": h["lat"],
+                                  "area_km2": h["area_km2"], "max_depth_m": h["max_depth_m"]}
+                                 for h in d["hotspots"][:3]]}
+        if name == "get_warning":
+            T = int(args.get("return_period", 100))
+            d = _load_depth_tif(T)
+            if d is None:
+                return {"error": "无该档水深栅格"}
+            w = _compute_warning(_get_dtm()[0], d, "%d年一遇" % T)
+            return {k: w[k] for k in ("city_level", "advice", "flooded_area_km2", "thresholds")} | {
+                "high_zones": [z0 for z0 in w["zones"] if z0["level"] != "无"]}
+        if name == "get_hotspots":
+            d = _load_depth_tif(100)
+            z0, tr0 = _get_dtm()
+            hs = hotspot_stats((d > DEPTH_THRESH) & (z0 > 0), d, tr0, int(args.get("top", 3))) if d is not None else []
+            return {"hotspots": hs}
+        if name == "get_impact":
+            T = int(args.get("return_period", 100))
+            d = _load_depth_tif(T)
+            if d is None:
+                return {"error": "无该档水深栅格"}
+            return impact_stats(d, _get_dtm()[1])
+        if name == "get_evacuation":
+            ev = _evacuation_core(int(args.get("return_period", 100)))
+            if not ev:
+                return {"error": "无数据"}
+            return {"shelters": ev["shelters"],
+                    "routes": [{"to": r["to"]["name"], "distance_m": r["distance_m"]}
+                               for r in ev["routes"]],
+                    "stranded": ev["stranded"]}
+        if name == "get_hydrograph":
+            return _hydrograph_core(float(args["lon"]), float(args["lat"]),
+                                    float(args.get("rain_mm", 200) or 200))
+        if name == "get_realtime":
+            d = realtime_rain()
+            return {k: d[k] for k in ("city_hour_rain_mm", "city_rain24h_mm",
+                                      "intensity_level", "advice", "note")}
+        if name == "get_forecast":
+            om = fetch_openmeteo(past_days=0, forecast_days=3)
+            if om is None:
+                return {"error": "预报源不可用"}
+            idx = _om_now_index(om)
+            fut = om["precip"][idx + 1:]
+            return {"next_24h_mm": round(sum(fut[:24]), 1),
+                    "next_72h_mm": round(sum(fut[:72]), 1),
+                    "note": "Open-Meteo 72h 逐时预报; 详见 /api/forecast_flood"}
+    except Exception as e:
+        return {"error": "工具执行失败: %s" % e}
+    return {"error": "未知工具 %s" % name}
+
+
+def _assistant_llm(q):
+    """LLM 问答编排(最多 3 回合工具调用); 未配置/失败返回 None(回退规则引擎)。"""
+    if not LLM_CFG["api_key"]:
+        return None
+    messages = [{"role": "system", "content": _LLM_SYSTEM},
+                {"role": "user", "content": q}]
+    for _ in range(3):
+        resp = llm_chat(LLM_CFG["base_url"], LLM_CFG["api_key"], LLM_CFG["model"],
+                        messages, tools=_LLM_TOOLS)
+        if resp is None:
+            return None
+        msg = resp["choices"][0].get("message") or {}
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            return {"answer": (msg.get("content") or "").strip() or None,
+                    "engine": "llm(%s)" % LLM_CFG["model"]}
+        messages.append({"role": "assistant", "content": msg.get("content") or "",
+                         "tool_calls": calls})
+        for c in calls:
+            fn = (c.get("function") or {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            out = _llm_tool_exec(fn.get("name") or "", args)
+            messages.append({"role": "tool", "tool_call_id": c.get("id") or "",
+                             "content": json.dumps(out, ensure_ascii=False)[:6000]})
+    return None
+
+
 @app.post("/api/assistant", tags=["智能问答"])
-def assistant(payload: dict = Body(...)):
-    """防汛问答: 规则解析(重现期/雨量模拟/易涝点/影响/损失/预警/疏散/原理), 全离线。"""
+def assistant(request: Request, payload: dict = Body(...)):
+    """防汛问答: LLM function-calling 优先(对标§四17, .env 配 LLM_API_KEY 启用,
+    工具直连本地 26 端点核心逻辑, 失败自动回退), 规则解析兜底(重现期/雨量模拟/易涝点/
+    影响/损失/预警/疏散/原理), 全离线可用。"""
     q = str(payload.get("question", "")).strip()
     if not q:
         return JSONResponse({"error": "问题不能为空"}, status_code=400)
+    if _rate_ok("chat:" + _client_ip(request), limit=12, window=60.0):
+        llm = _assistant_llm(q)
+        if llm and llm.get("answer"):
+            llm.setdefault("data", {})
+            return llm
     import re as _re
 
     def has(*words):
@@ -1729,7 +2149,10 @@ def assistant(payload: dict = Body(...)):
                 "action": {"type": "hotspot", "bbox": hs[0]["bbox"], "lon": hs[0]["lon"], "lat": hs[0]["lat"]}}
 
     if has("影响", "多少栋", "建筑", "人口", "多少人"):
-        im = impact_stats(_load_depth_tif(100), _get_dtm()[1])
+        dt100 = _load_depth_tif(100)
+        if dt100 is None:
+            return {"answer": "100年一遇水深栅格缺失, 暂无法统计影响。", "data": {}}
+        im = impact_stats(dt100, _get_dtm()[1])
         ans = ("100年一遇情景: 受影响建筑 %s/%s 栋, 受影响人口约 %s(%s口径), 淹没陆域 %.2f km²; "
                "分类型损失(万元): %s。"
                % (im["affected_buildings"], im["buildings_total"], _fmt_pop(im["affected_population"]),
@@ -1738,7 +2161,10 @@ def assistant(payload: dict = Body(...)):
         return {"answer": ans, "data": im}
 
     if has("损失", "经济损失", "多少钱", "赔偿"):
-        im = impact_stats(_load_depth_tif(100), _get_dtm()[1])
+        dt100 = _load_depth_tif(100)
+        if dt100 is None:
+            return {"answer": "100年一遇水深栅格缺失, 暂无法估算损失。", "data": {}}
+        im = impact_stats(dt100, _get_dtm()[1])
         ans = ("100年一遇情景建筑直接经济损失约 %.0f 万元(受影响 %s 栋)。分类型: %s。"
                "口径: 底面积×层数×重置单价×水深-损失率曲线(示例参数), 未计交通/管网等间接损失。"
                % (im["estimated_loss_wan"], im["affected_buildings"], im["loss_by_type_wan"]))
@@ -1878,12 +2304,14 @@ def report_status(rid: str, payload: dict = Body(...), request: Request = None,
     st = str(payload.get("status", ""))
     if st not in ("待核实", "已核实", "已处理", "误报"):
         return JSONResponse({"error": "非法状态"}, status_code=400)
-    lst = _load_reports()
-    for it in lst:
-        if it["id"] == rid:
-            it["status"] = st
-            _save_reports(lst)
-            return {"ok": True, "item": it}
+    # 读改写全程持锁(2026-10 审计 BE-01: 与 report_create 并发时旧快照整表覆盖会丢公众报汛)
+    with _report_lock:
+        lst = _load_reports()
+        for it in lst:
+            if it["id"] == rid:
+                it["status"] = st
+                _save_reports(lst)
+                return {"ok": True, "item": it}
     return JSONResponse({"error": "未找到该上报"}, status_code=404)
 
 
@@ -1923,6 +2351,331 @@ def subscribe_list(request: Request, token: str = Query(None)):
     if not _require_admin(_token_from(request, token)):
         return JSONResponse({"error": "需要管理员登录"}, status_code=401)
     return {"subscribers": _load_subscribers(), "total": len(_load_subscribers())}
+
+
+# ==== 集合预报(对标§四5): 多参数蒙特卡洛 → 逐格淹没概率场 ====
+_ens_m = _Memo()
+_C_LO, C_HI = 0.05, 0.95          # 径流系数采样钳位(与端点校验口径一致)
+
+
+def _design_rain(T):
+    p = os.path.join(ROOT, "flood_out", "scenarios.json")
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as f:
+            ss = json.load(f)
+        s = next((x for x in ss if x.get("return_period_y") == T), None)
+        if s:
+            return float(s["rain_mm"])
+    return float(RETURNS_FALLBACK.get(T, 300.6))
+
+
+def _ensemble_core(T, n=24):
+    """确定性种子蒙特卡洛: 设计暴雨 ±20% × 径流系数 ±0.07 → 淹没概率场与 W 分位数。
+    flood_core 反演为查表级, 24 个成员毫秒-秒级; 结果缓存(key=T,n)。"""
+    def _load():
+        model, transform = _get_flood_model()
+        land = model.z > 0
+        area = cell_area_m2(transform)
+        rain = _design_rain(T)
+        rng = random.Random(202600 + T)      # 固定种子: 可复现, 缓存友好
+        prob = np.zeros(model.z.shape, dtype="float32")
+        ws, areas = [], []
+        for _i in range(n):
+            r_i = rain * rng.uniform(0.8, 1.2)
+            c_i = min(C_HI, max(_C_LO, RUNOFF_COEF + rng.uniform(-0.07, 0.07)))
+            depth, finfo = model.flood(r_i / 1000.0 * c_i, area)
+            prob += ((depth > DEPTH_THRESH) & land).astype("float32")
+            ws.append(finfo["water_level_m"])
+            areas.append(round(float(((depth > DEPTH_THRESH) & land).sum() * area) / 1e6, 3))
+        prob /= n
+        ws = sorted(ws)
+        return {"prob": prob, "n": n, "rain_mm": rain,
+                "W_p10": round(ws[int(0.10 * n)], 2), "W_p50": round(ws[n // 2], 2),
+                "W_p90": round(ws[min(n - 1, int(0.90 * n))], 2),
+                "area_min_km2": min(areas), "area_max_km2": max(areas)}
+    return _ens_m.get_or_compute((T, n), _load)
+
+
+@app.get("/api/ensemble", tags=["情景与栅格"])
+def ensemble(return_period: int = Query(100, ge=2, le=100),
+             n: int = Query(24, ge=6, le=96)):
+    """集合不确定性(对标§四5, GloFAS 概率制图思路): 设计暴雨±20% × C±0.07 的确定性
+    蒙特卡洛成员 → 逐格淹没概率/水位分位数/淹没面积区间(把单一 ±20% 敏感性带升级为
+    概率场); 概率栅格可视化见 /api/ensemble_png。"""
+    d = _load_depth_tif(return_period)
+    if d is None:
+        return JSONResponse({"error": "无 %d 年水深栅格" % return_period}, status_code=404)
+    e = _ensemble_core(return_period, n)
+    return {"return_period": return_period, "members": e["n"], "rain_mm": e["rain_mm"],
+            "W_p10": e["W_p10"], "W_p50": e["W_p50"], "W_p90": e["W_p90"],
+            "flooded_area_km2_range": [e["area_min_km2"], e["area_max_km2"]],
+            "note": "确定性种子蒙特卡洛(雨量±20% × C±0.07); 概率=成员淹没频率"}
+
+
+@app.get("/api/ensemble_png", tags=["情景与栅格"])
+def ensemble_png(return_period: int = Query(100, ge=2, le=100)):
+    """集合淹没概率场 PNG(紫色 alpha 随概率, Copernicus GFM 概率图层风格);
+    前端以单幅影像叠加(与 ±20% 带同款用法)。"""
+    d = _load_depth_tif(return_period)
+    if d is None:
+        return JSONResponse({"error": "无 %d 年水深栅格" % return_period}, status_code=404)
+    e = _ensemble_core(return_period, 24)
+    pmask = e["prob"] > 0
+    alpha = (np.clip(e["prob"], 0, 1) * 210).astype("uint8")
+    img = np.zeros(e["prob"].shape + (4,), dtype="uint8")
+    img[..., 0] = np.where(pmask, 156, 0).astype("uint8")       # 紫色 #9c27b0
+    img[..., 1] = np.where(pmask, 39, 0).astype("uint8")
+    img[..., 2] = np.where(pmask, 176, 0).astype("uint8")
+    img[..., 3] = alpha                                                # alpha 随概率
+    buf = io.BytesIO()
+    Image.fromarray(img, "RGBA").save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ==== OGC API – Features(对标§四8): QGIS/ArcGIS 可直接消费的标准接口 ====
+def _ogc_link(href, rel, ftype="application/json", title=""):
+    return {"href": href, "rel": rel, "type": ftype, "title": title}
+
+
+@app.get("/api/ogc", tags=["OGC"])
+def ogc_landing(request: Request):
+    """OGC API – Features Part 1 入口(landing)。互操作生命线: 标准客户端可发现并遍历集合。"""
+    base = str(request.base_url).rstrip("/") + "/api/ogc"
+    return {"title": "C2132 珠江新城洪涝 OGC API", "description":
+            "淹没范围/建筑要素 OGC API – Features 服务(对标§四8, 供 QGIS/ArcGIS 直接加载)",
+            "links": [_ogc_link(base, "self"),
+                      _ogc_link(base + "/conformance", "conformance"),
+                      _ogc_link(base + "/collections", "data", title="要素集合")]}
+
+
+@app.get("/api/ogc/conformance", tags=["OGC"])
+def ogc_conformance():
+    return {"conformsTo": [
+        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
+        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson"]}
+
+
+_OGC_COLLECTIONS = {
+    "flood-extent": {"title": "淹没范围(多洼地)", "description": "各重现期淹没多边形, 每要素携带自身水面 W(m)",
+                     "query": {"return_period": "2/5/10/50/100"}},
+    "buildings": {"title": "建筑(珠江新城290栋)", "description": "建筑质心点: 名称/高度/类型/底面积"},
+}
+
+
+@app.get("/api/ogc/collections", tags=["OGC"])
+def ogc_collections(request: Request):
+    base = str(request.base_url).rstrip("/") + "/api/ogc/collections"
+    return {"collections": [
+        {"id": cid, **meta,
+         "links": [_ogc_link(base + "/" + cid, "self", title=meta["title"]),
+                   _ogc_link(base + "/" + cid + "/items", "items",
+                             "application/geo+json", "要素")]
+        } for cid, meta in _OGC_COLLECTIONS.items()], "links": []}
+
+
+@app.get("/api/ogc/collections/{cid}", tags=["OGC"])
+def ogc_collection(cid: str, request: Request):
+    base = str(request.base_url).rstrip("/") + "/api/ogc/collections"
+    if cid not in _OGC_COLLECTIONS:
+        return JSONResponse({"error": "未知集合 %s" % cid}, status_code=404)
+    return {"id": cid, **_OGC_COLLECTIONS[cid],
+            "extent": {"spatial": {"bbox": [[LON_MIN, LAT_MIN, LON_MAX, LAT_MAX]],
+                                   "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}},
+            "links": [_ogc_link(base + "/" + cid + "/items", "items",
+                                "application/geo+json", "要素"),
+                      _ogc_link(base + "/" + cid, "self")]}
+
+
+@app.get("/api/ogc/collections/{cid}/items", tags=["OGC"])
+def ogc_items(cid: str, return_period: int = Query(100, ge=2, le=100),
+              limit: int = Query(200, ge=1, le=2000), offset: int = Query(0, ge=0)):
+    """OGC Items(GeoJSON): flood-extent 按重现期返回淹没多边形(带 W); buildings 为质心点。
+    分页语义: numberMatched/numberReturned + next link(offset)。"""
+    if cid == "flood-extent":
+        p = os.path.join(ROOT, "flood_out", "flood_extent_%dy.geojson" % return_period)
+        if not os.path.exists(p):
+            return JSONResponse({"error": "无 %d 年淹没范围" % return_period}, status_code=404)
+        with open(p, encoding="utf-8") as f:
+            feats = json.load(f).get("features", [])
+    elif cid == "buildings":
+        feats = [{"type": "Feature",
+                  "geometry": {"type": "Point", "coordinates": [b["lon"], b["lat"]]},
+                  "properties": {k: b[k] for k in ("name", "height_m", "area_m2", "btype")}}
+                 for b in _get_buildings()]
+    else:
+        return JSONResponse({"error": "未知集合 %s" % cid}, status_code=404)
+    total = len(feats)
+    page = feats[offset:offset + limit]
+    out = {"type": "FeatureCollection", "numberMatched": total,
+           "numberReturned": len(page), "features": page}
+    if offset + limit < total:
+        out["links"] = [_ogc_link("/api/ogc/collections/%s/items?%s" % (
+            cid, "&".join(["return_period=%d" % return_period, "limit=%d" % limit,
+                           "offset=%d" % (offset + limit)])), "next", "application/geo+json")]
+    return JSONResponse(out, media_type="application/geo+json")
+
+
+# ==== COG(对标§四8): 水深栅格云优化 GeoTIFF, QGIS/GDAL http 直读 ====
+@app.get("/api/cog/{return_period}", tags=["OGC"])
+def cog(return_period: int):
+    """COG 水深栅格(tools/make_cogs.py 生成, 内建金字塔/瓦片序)。
+    QGIS 添加 WMS/WCS 之外可直接以 "HTTP(S) / COG" 打开本 URL。"""
+    if return_period not in RETURNS:
+        return JSONResponse({"error": "重现期须为 %s" % RETURNS}, status_code=404)
+    p = os.path.join(ROOT, "flood_out", "cog", "flood_depth_%dy_cog.tif" % return_period)
+    if not os.path.exists(p):
+        return JSONResponse({"error": "COG 尚未生成, 请先运行 tools/make_cogs.py"}, status_code=404)
+    return FileResponse(p, media_type="image/tiff",
+                        filename="flood_depth_%dy_cog.tif" % return_period)
+
+
+# ==== 标准化设计暴雨(对标§四4): 广州官方暴雨强度公式 + 交替块法设计雨型 ====
+@app.get("/api/design_storm", tags=["情景与栅格"])
+def design_storm(return_period: int = Query(50, ge=2, le=100),
+                 duration_min: int = Query(120, ge=30, le=180),
+                 step_min: int = Query(5, ge=5, le=15),
+                 peak_pos: float = Query(0.4, ge=0.2, le=0.8)):
+    """短历时设计暴雨(排水标准做法, 对标§四4): 《广州市暴雨强度公式(2022-12 版,
+    中心城区)》分区间参数公式给出各历时雨量 → 交替块法排列成雨型(峰值位于
+    peak_pos·T, 等效 Chicago 雨型峰现系数)。
+    一致性保证: 任一历时窗口内的最大雨量严格等于官方公式值(交替块法构造性质),
+    测试据此校验。源: 广州市水务局 2023-03-07 公告及所附技术报告。"""
+    K = duration_min // step_min
+    if K < 2:
+        return JSONResponse({"error": "历时须为步长的整数倍且≥2块"}, status_code=400)
+    durs = [(k + 1) * step_min for k in range(K)]
+    try:
+        cum = [gz_rainfall_intensity(t, return_period) * t for t in durs]   # 各历时累计雨量 mm
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    blocks = [cum[0]] + [cum[k] - cum[k - 1] for k in range(1, K)]
+    # 交替块排列: 先生成槽位序列[峰位,+1,-1,+2,-2…](越界跳过), 块按降序依秩次放入;
+    # 保证任一历时窗口的最大雨量=官方公式值(交替块法构造性质), 峰值块位于 peak_pos·T
+    order = sorted(range(K), key=lambda k: -blocks[k])
+    peak = int(round(peak_pos * K))
+    seq = [peak]
+    step = 1
+    while len(seq) < K:
+        if peak + step < K:
+            seq.append(peak + step)
+        if len(seq) < K and peak - step >= 0:
+            seq.append(peak - step)
+        step += 1
+    slots = [0] * K
+    for rank, k in enumerate(order):
+        slots[seq[rank]] = k
+    hyeto = [0.0] * K
+    for slot_i, block_k in enumerate(slots):
+        hyeto[slot_i] = round(blocks[block_k], 2)
+    total = round(sum(hyeto), 2)
+    return {"source": "广州市暴雨强度公式(2022-12版, 中心城区; 广州市水务局 2023-03 公告)",
+            "return_period": return_period, "duration_min": duration_min,
+            "step_min": step_min, "peak_pos": peak_pos,
+            "total_mm": round(total, 1),
+            "max_60min_mm": round(max((sum(hyeto[i:i + 12 // step_min])
+                                       for i in range(0, K - max(1, 12 // step_min) + 1)), default=0.0), 1),
+            "hyetograph_mm": hyeto,
+            "labels_min": [(k + 1) * step_min for k in range(K)],
+            "note": "交替块法排列(等效 Chicago 雨型): 任一历时最大窗口雨量=官方公式值; "
+                    "24h 情景演进仍用三角雨型(与 P-III 设计暴雨口径一致)"}
+
+
+# ==== 关键设施受淹与服务缺口(对标§四16 简化版): 天地图 POI + 可选电网节点 ====
+_FACILITIES_CACHE = None
+_FAC_FAIL_M = 0.5          # 设施场地积水≥0.5m 判"功能受损"(示例参数)
+_FAC_SERVICE_KM = {"医院": 3.0, "消防站": 5.0, "派出所": 3.0, "学校": 1.5,
+                   "幼儿园": 1.5, "泵站": 2.0, "变电站": 1.5}
+_FAC_BACKUP_H = {"医院": 12, "消防站": 24, "派出所": 12, "泵站": 0,
+                 "变电站": 0, "学校": 0, "幼儿园": 0}   # 备用电源可用时长(示例, h)
+
+
+def _critical_facilities():
+    global _FACILITIES_CACHE
+    if _FACILITIES_CACHE is None:
+        p = os.path.join(ROOT, "flood_out", "critical_facilities.json")
+        d = {"features": [], "source": ""}
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    j = json.load(f)
+                if isinstance(j.get("features"), list):
+                    d = j
+            except Exception as e:
+                _log.warning("critical_facilities.json 解析失败: %s", e)
+        _FACILITIES_CACHE = d
+    return _FACILITIES_CACHE
+
+
+def _haversine_km(lon1, lat1, lon2, lat2):
+    from math import cos, radians, sin, asin, sqrt
+    lon1, lat1, lon2, lat2 = map(radians, (lon1, lat1, lon2, lat2))
+    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+    return 2 * 6371.0 * asin(sqrt(h))
+
+
+@app.get("/api/cascade", tags=["影响分析"])
+def cascade(d=Depends(_depth_or_404), return_period: int = Query(100, ge=2, le=100),
+            max_edges: int = Query(40, ge=0, le=200)):
+    """关键设施受淹与服务缺口(对标§四16 的数据可得简化版):
+    节点=天地图 POI(flood_out/critical_facilities.json, tools/fetch_facilities.py 再生)
+    + 可选电网节点(同文件 kind="变电站"; 当前网络环境下变电站公开数据未获取, 如实标注);
+    设施场地积水≥0.5m 判功能受损 → 统计其服务半径内的建筑总数/受淹数(服务缺口),
+    变电站节点失效时联动列出半径内"失电风险"设施。输出节点+连线供三维上图。"""
+    z, transform = _get_dtm()
+    d_land = np.where(z > 0, d, 0.0)
+    facs = _critical_facilities().get("features", [])
+    nodes, edges = [], []
+    grid_nodes = [x for x in facs if x.get("kind") == "变电站"]
+    have_grid = bool(grid_nodes)
+    for f in facs:
+        kind = f.get("kind", "")
+        dv = _sample_grid(d_land, transform, f["lon"], f["lat"])
+        depth = round(dv, 2) if dv is not None else None
+        failed = depth is not None and depth > _FAC_FAIL_M
+        r_km = _FAC_SERVICE_KM.get(kind, 2.0)
+        node = {"name": f.get("name") or kind, "kind": kind,
+                "lon": f["lon"], "lat": f["lat"], "depth_m": depth,
+                "failed": failed, "service_km": r_km,
+                "backup_hours": _FAC_BACKUP_H.get(kind, 0)}
+        if failed and kind != "变电站":
+            in_r = [b for b in _get_buildings()
+                    if _haversine_km(f["lon"], f["lat"], b["lon"], b["lat"]) <= r_km]
+            node["buildings_in_radius"] = len(in_r)
+            node["flooded_in_radius"] = sum(
+                1 for b in in_r
+                if (_sample_grid(d_land, transform, b["lon"], b["lat"]) or 0) > DEPTH_THRESH)
+            node["service_gap"] = "服务半径内建筑受淹 %d/%d 栋, 该设施功能受损放大缺口" % (
+                node["flooded_in_radius"], node["buildings_in_radius"])
+            # 连线: 半径内受淹最深的 ≤8 栋(供前端画服务缺口线)
+            deep = sorted(((b, _sample_grid(d_land, transform, b["lon"], b["lat"]) or 0.0)
+                           for b in in_r), key=lambda x: -x[1])[:8]
+            for b, bd in deep:
+                if bd > DEPTH_THRESH and len(edges) < max_edges:
+                    edges.append({"from": {"lon": f["lon"], "lat": f["lat"]},
+                                  "to": {"lon": b["lon"], "lat": b["lat"],
+                                         "name": b["name"], "depth_m": round(bd, 2)}})
+        if failed and kind == "变电站":
+            risk = [{"name": x.get("name"), "kind": x.get("kind"),
+                     "backup_hours": _FAC_BACKUP_H.get(x.get("kind"), 0)}
+                    for x in facs
+                    if x is not f and x.get("kind") != "变电站"
+                    and _haversine_km(f["lon"], f["lat"], x["lon"], x["lat"]) <= r_km]
+            node["power_outage_risk"] = risk
+        nodes.append(node)
+    nodes.sort(key=lambda n: (-(n["depth_m"] or 0)))
+    n_failed = sum(1 for n in nodes if n["failed"])
+    note = ("关键设施 %d 处: 受损 %d(场地积水>%.2fm); 服务半径/备用时长为示例参数。" % (
+        len(nodes), n_failed, _FAC_FAIL_M))
+    if not have_grid:
+        note += (" 电网节点(变电站)公开 POI 在当前数据源不可得(Overpass/OSM 主 API 本机网络"
+                 "不可达, 天地图库无覆盖), 网络型连锁失效以'设施受淹→服务缺口'替代, "
+                 "tools/fetch_facilities.py 数据补齐后自动纳入电网联动。")
+    return {"return_period": return_period,
+            "total": len(nodes), "failed": n_failed,
+            "grid_nodes": len(grid_nodes),
+            "nodes": nodes, "edges": edges,
+            "note": note,
+            "source": _critical_facilities().get("source", "")}
 
 
 # ---------------- 前端静态托管(安全白名单) ----------------

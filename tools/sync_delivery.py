@@ -13,6 +13,7 @@ SRC = os.path.join(ROOT, "C2132_开发源码")
 # 静态清单: 未提交的新文件(git 跟踪不到)也必须随包; 已跟踪文件由下方并集兜底
 FILES = [
     "app.py", "pipeline_config.py", "proj_fix.py", "store.py", "flood_render.py",
+    "flood_core.py", "externals.py",
     "sat_data.py", "sar_change.py", "unet_model.py", "unet_apply.py",
     os.path.join("pipeline", "bathtub_flood.py"), os.path.join("pipeline", "fetch_dem.py"),
     os.path.join("pipeline", "fetch_pop.py"), os.path.join("pipeline", "prep_precip.py"),

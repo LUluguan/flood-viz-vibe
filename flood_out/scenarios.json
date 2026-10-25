@@ -3,55 +3,150 @@
     "return_period_y": 2,
     "rain_mm": 118.5,
     "runoff_depth_m": 0.0592,
-    "water_level_m": 3.11,
-    "max_depth_m": 3.11,
-    "mean_depth_m": 1.19,
-    "flooded_area_km2": 0.792,
-    "flooded_cells": 907,
-    "river_cells": 2485
+    "water_level_m": 2.68,
+    "max_depth_m": 4.13,
+    "mean_depth_m": 0.71,
+    "flooded_area_km2": 0.888,
+    "flooded_cells": 1016,
+    "river_cells": 2485,
+    "method": "multi-depression",
+    "n_pools": 281,
+    "top_pools": [
+      {
+        "W_m": 21.944,
+        "area_cells": 11,
+        "catchment_cells": 39
+      },
+      {
+        "W_m": 19.935,
+        "area_cells": 5,
+        "catchment_cells": 25
+      },
+      {
+        "W_m": 18.309,
+        "area_cells": 5,
+        "catchment_cells": 15
+      }
+    ]
   },
   {
     "return_period_y": 5,
     "rain_mm": 166.3,
     "runoff_depth_m": 0.0832,
-    "water_level_m": 3.52,
-    "max_depth_m": 3.52,
-    "mean_depth_m": 1.29,
-    "flooded_area_km2": 1.026,
-    "flooded_cells": 1175,
-    "river_cells": 2485
+    "water_level_m": 2.96,
+    "max_depth_m": 4.47,
+    "mean_depth_m": 0.8,
+    "flooded_area_km2": 1.082,
+    "flooded_cells": 1239,
+    "river_cells": 2485,
+    "method": "multi-depression",
+    "n_pools": 281,
+    "top_pools": [
+      {
+        "W_m": 22.188,
+        "area_cells": 11,
+        "catchment_cells": 39
+      },
+      {
+        "W_m": 20.085,
+        "area_cells": 5,
+        "catchment_cells": 25
+      },
+      {
+        "W_m": 18.667,
+        "area_cells": 5,
+        "catchment_cells": 15
+      }
+    ]
   },
   {
     "return_period_y": 10,
     "rain_mm": 198.9,
     "runoff_depth_m": 0.0994,
-    "water_level_m": 3.75,
-    "max_depth_m": 3.75,
-    "mean_depth_m": 1.33,
-    "flooded_area_km2": 1.19,
-    "flooded_cells": 1362,
-    "river_cells": 2485
+    "water_level_m": 4.18,
+    "max_depth_m": 4.67,
+    "mean_depth_m": 0.85,
+    "flooded_area_km2": 1.209,
+    "flooded_cells": 1384,
+    "river_cells": 2485,
+    "method": "multi-depression",
+    "n_pools": 281,
+    "top_pools": [
+      {
+        "W_m": 22.324,
+        "area_cells": 11,
+        "catchment_cells": 39
+      },
+      {
+        "W_m": 20.166,
+        "area_cells": 5,
+        "catchment_cells": 25
+      },
+      {
+        "W_m": 18.912,
+        "area_cells": 5,
+        "catchment_cells": 15
+      }
+    ]
   },
   {
     "return_period_y": 50,
     "rain_mm": 270.6,
     "runoff_depth_m": 0.1353,
-    "water_level_m": 4.16,
-    "max_depth_m": 4.16,
-    "mean_depth_m": 1.42,
-    "flooded_area_km2": 1.523,
-    "flooded_cells": 1743,
-    "river_cells": 2485
+    "water_level_m": 4.46,
+    "max_depth_m": 5.0,
+    "mean_depth_m": 0.95,
+    "flooded_area_km2": 1.435,
+    "flooded_cells": 1643,
+    "river_cells": 2485,
+    "method": "multi-depression",
+    "n_pools": 281,
+    "top_pools": [
+      {
+        "W_m": 22.59,
+        "area_cells": 11,
+        "catchment_cells": 39
+      },
+      {
+        "W_m": 20.345,
+        "area_cells": 5,
+        "catchment_cells": 25
+      },
+      {
+        "W_m": 19.45,
+        "area_cells": 5,
+        "catchment_cells": 15
+      }
+    ]
   },
   {
     "return_period_y": 100,
     "rain_mm": 300.6,
     "runoff_depth_m": 0.1503,
-    "water_level_m": 4.31,
-    "max_depth_m": 4.3,
-    "mean_depth_m": 1.45,
-    "flooded_area_km2": 1.656,
-    "flooded_cells": 1896,
-    "river_cells": 2485
+    "water_level_m": 4.57,
+    "max_depth_m": 5.14,
+    "mean_depth_m": 0.98,
+    "flooded_area_km2": 1.509,
+    "flooded_cells": 1727,
+    "river_cells": 2485,
+    "method": "multi-depression",
+    "n_pools": 281,
+    "top_pools": [
+      {
+        "W_m": 22.687,
+        "area_cells": 11,
+        "catchment_cells": 39
+      },
+      {
+        "W_m": 20.418,
+        "area_cells": 5,
+        "catchment_cells": 25
+      },
+      {
+        "W_m": 19.675,
+        "area_cells": 5,
+        "catchment_cells": 15
+      }
+    ]
   }
 ]

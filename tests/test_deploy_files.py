@@ -101,12 +101,15 @@ def test_delivery_copy_tracked_complete():
     以 git 跟踪清单为真源, 新布局(pipeline/ web/data/ deploy/ docs/)自动覆盖。"""
     import subprocess
     copy_dir = _copy_dir()
-    r = subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=ROOT)
+    # -z: NUL 分隔且不对中文路径做八进制引号转义(quotepath 默认开, 字面比对会假缺失)
+    r = subprocess.run(["git", "ls-files", "-z"], capture_output=True, cwd=ROOT)
     if r.returncode != 0:
         pytest.skip("非 git 环境, 跳过副本完整性守护")
     missing = []
     checked = 0
-    for rel in r.stdout.splitlines():
+    for rel in r.stdout.decode("utf-8", "replace").split("\0"):
+        if not rel:
+            continue
         rp = rel.replace("\\", "/")
         if rp.startswith("reports/"):   # 运行期用户数据, 按隐私策略不入副本
             continue

@@ -251,10 +251,18 @@
               var b = document.createElement('button');
               b.textContent = st;
               b.onclick = function() {
-                fetch('/api/report/' + x.id + '/status?token=' + localStorage.getItem('flood_token'),
-                  { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                // token 走请求头(2026-10 审计 FE-02: query 里的 token 会进访问日志) + 失败反馈
+                b.disabled = true;
+                fetch('/api/report/' + x.id + '/status',
+                  { method: 'POST',
+                    headers: { 'Content-Type': 'application/json',
+                               'x-auth-token': localStorage.getItem('flood_token') || '' },
                     body: JSON.stringify({ status: st }) }).then(function(r) { return r.json(); })
-                  .then(function() { loadReports(); });
+                  .then(function(d) {
+                    b.disabled = false;
+                    if (d && d.error) { alert('更新失败: ' + d.error); return; }
+                    loadReports();
+                  }).catch(function() { b.disabled = false; alert('更新失败: 网络错误'); });
               };
               bar.appendChild(b);
             });

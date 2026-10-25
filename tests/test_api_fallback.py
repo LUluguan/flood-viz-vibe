@@ -45,9 +45,10 @@ def test_depth_hist_period_variant():
     assert h2["counts"] != h100["counts"], "不同重现期水深分布应不同"
     assert sum(h2["counts"]) < sum(h100["counts"]), "高重现期淹没格网应更多"
     assert h2["warn"] != h100["warn"]
-    # 排除河道后: 陆地水深 ≤ 水位W(<5m), >5m 档应为 0, 且 3-5m 档不再被河道主导
-    assert h100["counts"][5] == 0, "排除河道后不应有>5m陆地水深"
-    assert h2["counts"][5] == 0
+    # 排除河道后: 深度不再被河道(-12m)主导; 多洼地算法(2026-10 对标§四1)下深层封闭
+    # 洼地最大水深约 5.1m(100年), >5m 档仅零星格(旧全局浴缸时恒 0, 现允许极少量)
+    assert h100["counts"][5] <= 5, "排除河道后 >5m 陆地水深应只剩零星深层洼地格"
+    assert h2["counts"][5] <= 5
     assert h100["counts"][4] < 500, "3-5m档不应再包含河道(应只数百格陆地)"
     print("depth_hist 随重现期动态变化 + 排除河道 OK")
 
