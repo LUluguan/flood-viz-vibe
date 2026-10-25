@@ -6,7 +6,7 @@
 - 例外：无。即使用户说"推 git"时，也应先列出待推送清单供确认（如与上次推送内容一致可简要说明后直接推）。
 
 ## 项目背景速览
-- 华南农业大学 2026 易智瑞杯中国大学生 GIS 竞赛 C2132 作品《基于 WebGIS 的三维城市降雨洪涝可视化表达》
+- 华南农业大学 2026 易智瑞杯中国大学生 GIS 竞赛 C2132 作品《洪涝可视化（vibe）——三维城市降雨洪涝可视化表达》（2026-10-25 由用户要求更名，原名《基于 WebGIS 的三维城市降雨洪涝可视化表达》）
 - 技术栈：FastAPI（app.py，8001 端口）+ CesiumJS 三维 + ECharts 大屏 + PostGIS（可选）+ UNet 深度学习
-- 远程仓库：github.com/LUluguan/WebGIS（main 分支）
+- 远程仓库：github.com/LUluguan/flood-viz-vibe（main 分支；2026-10-25 由 WebGIS 更名而来，旧链接自动重定向）
 - 竞品调研笔记：`.tmp_read/rival_works_notes.md`（19 个应用开发组获奖作品的功能清单与缺失功能分析，2026-08-29）

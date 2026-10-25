@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app.py — 广东降雨洪涝 WebGIS 服务层(FastAPI)
+app.py — 广东降雨洪涝可视化（vibe）服务层(FastAPI)
 
 架构: 数据层(PostGIS) -> 服务层(本文件) -> 表现层(index/dashboard/realevent/unet.html)
 
@@ -136,7 +136,7 @@ _DOCS = os.environ.get("FLOOD_DOCS", "").strip() == "1"
 _state = {"db_fallbacks": 0, "scenarios_source": "file"}
 
 app = FastAPI(
-    title="广东降雨洪涝 WebGIS 服务层", version="1.6",
+    title="广东降雨洪涝可视化（vibe）服务层", version="1.6",
     docs_url="/docs" if _DOCS else None,
     redoc_url=None,
     openapi_url="/openapi.json" if _DOCS else None,
@@ -571,7 +571,7 @@ def health():
     hits = sum(m.stats()[0] for m in memos.values())
     misses = sum(m.stats()[1] for m in memos.values())
     return {
-        "status": "ok", "service": "flood-webgis", "version": app.version,
+        "status": "ok", "service": "flood-viz-vibe", "version": app.version,
         "db_reachable": _db_reachable(), "db_first": _db_first(),
         "scenarios_source": _state.get("scenarios_source", "file"),
         "db_fallbacks": _state.get("db_fallbacks", 0),
@@ -1624,7 +1624,7 @@ def _theme_decorate(draw, map_l, map_t, map_r, map_b, mw, mh, product, return_pe
                     "facilities": "珠江新城 %d 年一遇暴雨·受影响关键设施图" % return_period,
                     "hazard": "珠江新城 %d 年一遇暴雨·洪涝危险分级图" % return_period}[product]
     draw.text((map_l, 40), ttl, font=f_title, fill="#102a43")
-    draw.text((map_l, 14), "C2132 · 基于WebGIS的三维城市降雨洪涝可视化表达", font=f_med, fill="#486581")
+    draw.text((map_l, 14), "C2132 · 洪涝可视化（vibe）· 三维城市降雨洪涝可视化表达", font=f_med, fill="#486581")
     # 制图时间用情景结果文件的生成时间(而非请求时刻), 缓存字节流才稳定
     try:
         gen_at = datetime.datetime.fromtimestamp(
@@ -1909,7 +1909,7 @@ def _fmt_pop(n):
 
 
 _LLM_SYSTEM = (
-    "你是城市洪涝防汛助手, 服务于广州珠江新城 WebGIS 平台(多洼地浴缸法淹没模型)。"
+    "你是城市洪涝防汛助手, 服务于广州珠江新城洪涝可视化（vibe）平台(多洼地浴缸法淹没模型)。"
     "回答前必须调用工具获取真实数据, 禁止编造数值; 用简体中文、60-150字、直接给结论与建议。"
     "用户未指定重现期时, 情景/预警/影响/疏散类工具一律用 return_period=100(最高档)。"
     "可用能力: 重现期情景(2/5/10/50/100年)、在线模拟(雨量mm/径流系数/排水折减)、"

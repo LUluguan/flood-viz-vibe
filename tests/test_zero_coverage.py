@@ -13,7 +13,7 @@ def test_health():
     r = c.get("/api/health")
     assert r.status_code == 200
     d = r.json()
-    assert d["status"] == "ok" and d["service"] == "flood-webgis", d
+    assert d["status"] == "ok" and d["service"] == "flood-viz-vibe", d
     print("health OK", d)
 
 def test_flood_depth_png():

@@ -22,7 +22,7 @@ _log = logging.getLogger("flood.externals")
 
 _HTTP_TIMEOUT = 8          # 出网默认超时(s): 快失败, 不拖端点
 _LLM_TIMEOUT = 25          # LLM 允许更长(生成+工具回合)
-_UA = {"User-Agent": "C2132-flood-webgis/1.6 (competition demo)"}
+_UA = {"User-Agent": "C2132-flood-viz-vibe/1.6 (competition demo)"}
 
 
 # ================= Open-Meteo(免费无key): 实况(近24h) + 预报(未来72h) =================

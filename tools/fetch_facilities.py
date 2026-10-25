@@ -50,7 +50,7 @@ def search_keyword(tk, kw):
                "&type=query&tk=" + tk)
         req = urllib.request.Request(url, headers={
             "Referer": "http://localhost:8001/",
-            "User-Agent": "Mozilla/5.0 C2132-flood-webgis/1.7"})
+            "User-Agent": "Mozilla/5.0 C2132-flood-viz-vibe/1.7"})
         try:
             d = json.loads(urllib.request.urlopen(req, timeout=20).read())
         except Exception as e:

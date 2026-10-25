@@ -7,7 +7,7 @@ from gen_competition_docs import new_doc, title, heading, para, add_table, table
 
 def main():
     doc = new_doc()
-    title(doc, "GeoScene / ArcGIS Online 发布指南", "广东降雨洪涝 WebGIS · 满足竞赛\"不脱离GeoScene服务器端产品\"要求")
+    title(doc, "GeoScene / ArcGIS Online 发布指南", "广东降雨洪涝可视化（vibe）· 满足竞赛\"不脱离GeoScene服务器端产品\"要求")
     heading(doc, "一、目的")
     para(doc, "竞赛要求服务器端部署不能完全脱离 GeoScene 服务器端产品。本工程通过把核心地理数据（淹没范围、水深栅格）发布为 ArcGIS Online 托管服务，由前端 Cesium 消费，使服务端部署具备对 GeoScene（Esri 服务器端基础设施）的真实依赖；未配置时自动回退本地数据以保证演示。")
     heading(doc, "二、前置准备")

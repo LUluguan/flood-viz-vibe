@@ -16,7 +16,7 @@
 
 ## Worktree 方案(如需真正隔离)
 ```bash
-git worktree add ../WebGIS-audit HEAD    # 审计用独立副本
-cd ../WebGIS-audit && pip install -r requirements.txt && pytest -q
+git worktree add ../floodviz-audit HEAD    # 审计用独立副本
+cd ../floodviz-audit && pip install -r requirements.txt && pytest -q
 # 审计结论出后再切回主目录
 ```
