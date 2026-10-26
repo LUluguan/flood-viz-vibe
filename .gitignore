@@ -22,6 +22,7 @@ __pycache__/
 
 # ===== 临时/环境 =====
 tmp_*
+.tmp_*
 .claude/
 .env
 # 本地私有凭据(天地图 key / Ion token), 只进交付包不入仓库; 行尾不可写注释(git 不支持)
