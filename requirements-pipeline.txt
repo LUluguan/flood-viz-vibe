@@ -1,0 +1,6 @@
+# Offline NetCDF preprocessing and competition document generation only.
+# Use with requirements-runtime.txt and requirements-cpu.txt, not in the web image.
+# PyPI在本机Windows+Python3.13没有可用wheel；Web与通用测试不依赖它。
+# Windows请用支持该库的Python环境或Linux完成NC预处理，脚本缺失时给出明确提示。
+netCDF4>=1.6,<2.0; platform_system != "Windows"
+python-docx>=1.1,<2.0

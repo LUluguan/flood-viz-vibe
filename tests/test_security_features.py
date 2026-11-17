@@ -21,12 +21,12 @@ def test_static_whitelist():
               "/unet_out/unet_water.pt", "/unet_out/unet_water_region.pt",
               "/realevent_out/yingde/_cache.npz", "/realevent_out/_cache.npz",
               "/C2132_作品介绍视频.mp4", "/README.md",
-              # 凭据/隐私 JSON basename 黑名单(2026-10 安全审计)
+              # 凭据/隐私文件不得静态读取；照片 JSON 经鉴权路由统一401
               "/web_users.json", "/reports/subscribers.json", "/reports/reports.json"]:
         r = c.get(p)
-        assert r.status_code == 404, "%s 应被静态白名单拒绝, 实际 %s" % (p, r.status_code)
-    # 报汛照片仍需可访问(移动端列表展示)
-    assert c.get("/reports/").status_code in (200, 404)
+        expected = 401 if p.startswith("/reports/") else 404
+        assert r.status_code == expected, "%s 应拒绝匿名读取, 实际 %s" % (p, r.status_code)
+    assert c.get("/reports/img_r9abc.jpg").status_code == 401  # 合法照片路径统一鉴权
     print("静态白名单 OK: .env/.pt/.npz/.py/.bat/.mp4/.md/凭据JSON 全部 404, 前端资源 200")
 
 def test_impact():
@@ -60,7 +60,8 @@ def test_report_xss_and_abuse_hardening():
     自清理: 结束后恢复 reports.json 快照, 不给交付数据留测试残留。"""
     c = TestClient(app.app)
     import json as _json
-    rp = os.path.join(ROOT, "reports", "reports.json")
+    import store
+    rp = store._REPORTS_FILE
     snap = _json.load(open(rp, encoding="utf-8")) if os.path.exists(rp) else []
     try:
         # XSS 载荷入库前必须剥标签
@@ -84,10 +85,10 @@ def test_report_xss_and_abuse_hardening():
         assert 429 in codes, codes
     finally:
         _json.dump(snap, open(rp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        for f in os.listdir(os.path.join(ROOT, "reports")):
+        for f in os.listdir(store._REPORT_DIR):
             if f.startswith("img_r9") and _json.dumps(snap).find(f.rsplit(".", 1)[0]) < 0:
                 try:
-                    os.remove(os.path.join(ROOT, "reports", f))
+                    os.remove(os.path.join(store._REPORT_DIR, f))
                 except OSError:
                     pass
     # 双斜杠探测("//web_users.json" 等)在真实服务器上已 404(redirect_slashes=False + basename 黑名单,

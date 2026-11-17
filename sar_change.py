@@ -4,8 +4,10 @@ import numpy as np
 
 
 def to_db(arr, linear_thresh=1.0):
-    """线性功率/幅度 → dB; 已是 dB(必然含负值)原样返回。
+    """线性功率 → dB(10*log10)；含负值的数据按已经是 dB 原样返回。
     判定依据: 功率域非负(S1 RTC gamma0 典型中位 ≈0.18), dB 域典型 -30..0 且含负值。
+    这是基于 S1 RTC 的启发式, 并非所有非负 dB 数据都能自动识别；不用于线性幅度。
+    linear_thresh 已弃用且不生效, 仅保留位置/关键字调用兼容；不再以中位数阈值区分单位。
     旧版以"中位数>1"判定线性, 对 RTC 功率永不触发 → drop_db 阈值失效、变化掩膜近似为空。"""
     v = arr[np.isfinite(arr)]
     if v.size == 0:

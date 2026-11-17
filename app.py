@@ -38,6 +38,7 @@ app.py — 广东降雨洪涝可视化（vibe）服务层(FastAPI)
 """
 import io, json, math, os, re, time, uuid, random, datetime, base64
 import threading
+from contextlib import closing
 import numpy as np
 try:
     from dotenv import load_dotenv
@@ -78,9 +79,22 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # 读取 .env(可选): 提供 FLOOD_DB_* / GEOSCENE_* 配置; 未配置口令时数据库连接失败, 接口自动回退本地数据
 if load_dotenv:
     load_dotenv(os.path.join(ROOT, ".env"))
+def _env_port(name, default):
+    try:
+        port = int(os.environ.get(name, str(default)))
+        if not 1 <= port <= 65535:
+            raise ValueError
+        return port
+    except ValueError:
+        _log.warning("%s 不是有效端口，使用默认值", name)
+        return default
+
+
 DB = dict(
     host=os.environ.get("FLOOD_DB_HOST", "localhost"),
-    port=int(os.environ.get("FLOOD_DB_PORT", "5432")),
+    port=_env_port("FLOOD_DB_PORT", 5432),
+    connect_timeout=3,
+    options="-c statement_timeout=3000",
     dbname=os.environ.get("FLOOD_DB_NAME", "flood_analysis"),
     user=os.environ.get("FLOOD_DB_USER", "postgres"),
     password=os.environ.get("FLOOD_DB_PASSWORD"),
@@ -91,11 +105,10 @@ from pipeline_config import (DEPTH_THRESH, RUNOFF_COEF, STUDY_WS,
                             RETURNS, RETURNS_FALLBACK,
                             LON_MIN, LAT_MIN, LON_MAX, LAT_MAX)  # 全仓唯一权威常量
 from store import (_REPORT_DIR, _load_reports, _save_reports,
-                    _report_lock, _subscribers_lock, SUBSCRIBER_CAP,
+                    _report_lock,
                     _rate_ok, _client_ip, _clean_text,
-                    _load_subscribers, _save_subscribers,
-                    _verify_pw, _upgrade_pw, _load_users,
-                    _state_quarantines)
+                    _load_subscribers,
+                    _verify_pw, _upgrade_pw, _load_users)
 from flood_render import colorize   # 水深色带唯一实现(app/导出脚本共用, ARC-01)
 from flood_core import DepressionModel   # 多洼地独立水面浴缸法(唯一实现, 对标§四1)
 from rasterio.features import shapes as _rio_shapes, rasterize as _rio_rasterize
@@ -114,7 +127,8 @@ from externals import (fetch_openmeteo, llm_chat, notify_async, notify_due)
 WECOM_WEBHOOK_URL = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
 SMTP_CFG = {
     "host": os.environ.get("SMTP_HOST", "").strip(),
-    "port": int(os.environ.get("SMTP_PORT", "465") or 465),
+    "port": _env_port("SMTP_PORT", 587 if os.environ.get("SMTP_SECURITY") == "starttls" else 465),
+    "security": os.environ.get("SMTP_SECURITY") or ("ssl" if os.environ.get("SMTP_USE_TLS", "1") != "0" else "none"),
     "user": os.environ.get("SMTP_USER", "").strip(),
     "password": os.environ.get("SMTP_PASSWORD", "").strip(),
     "use_tls": os.environ.get("SMTP_USE_TLS", "1").strip() != "0",
@@ -134,9 +148,15 @@ except ImportError:
 # 交互式 API 文档默认关闭(不向访客暴露接口面); 设 FLOOD_DOCS=1 按需开启
 _DOCS = os.environ.get("FLOOD_DOCS", "").strip() == "1"
 _state = {"db_fallbacks": 0, "scenarios_source": "file"}
+_db_fallback_lock = threading.Lock()
+
+
+def _mark_db_fallback():
+    with _db_fallback_lock:
+        _state["db_fallbacks"] += 1
 
 app = FastAPI(
-    title="广东降雨洪涝可视化（vibe）服务层", version="1.6",
+    title="广东降雨洪涝可视化（vibe）服务层", version="1.7",
     docs_url="/docs" if _DOCS else None,
     redoc_url=None,
     openapi_url="/openapi.json" if _DOCS else None,
@@ -190,39 +210,9 @@ def get_conn():
 # colorize 已下沉 flood_render.py(共享唯一实现, 顶部 import 使用)
 
 
-# ==== 共享缓存: 简单"查→算→存"统一走 _Memo(一把锁防并发首击 dogpile, FIFO 上限淘汰)。
-# 保留手写的特例(语义特殊, 勿强行统一):
-#   _warn_cache    published_at 需每请求刷新
-#   _monthly_cache 缺失回退 + 存在性复检(测试打桩依赖)
-#   _theme_cache   自定义标题不入缓存
-#   _evac_cache    结果聚合对象大, 且含"缺栅格→None"分支
-class _Memo:
-    def __init__(self, limit=None):
-        self._data = {}
-        self._order = []
-        self._lock = threading.Lock()
-        self._limit = limit
-        self._hits = 0
-        self._misses = 0
-
-    def stats(self):
-        """(命中, 未命中) — 供 /api/health 观测。"""
-        return (self._hits, self._misses)
-
-    def get_or_compute(self, key, fn):
-        with self._lock:
-            if key in self._data:
-                self._hits += 1
-                return self._data[key]
-            self._misses += 1
-        val = fn()
-        with self._lock:
-            if key not in self._data:
-                self._data[key] = val
-                self._order.append(key)
-                if self._limit and len(self._order) > self._limit:
-                    self._data.pop(self._order.pop(0), None)
-        return val
+# 有界 single-flight 缓存；实现独立于 API，保留名称兼容已有调用。
+from service_support import Memo as _Memo, RequestGuardMiddleware
+app.add_middleware(RequestGuardMiddleware)
 
 _dtm_m = _Memo()
 _png_m = _Memo()
@@ -232,7 +222,7 @@ _hotspot_m = _Memo()
 _bld_m = _Memo()
 _pop_m = _Memo()
 _unc_m = _Memo()
-_evac_m = _Memo()
+_evac_m = _Memo(limit=64)
 
 
 def _get_dtm():
@@ -317,7 +307,7 @@ def _ring_area_m2(ring, lat):
 
 
 def _get_buildings():
-    """缓存建筑(珠江新城 290 栋): 质心经纬度 + 名称 + 高度 + 底面积 + 类型。"""
+    """缓存建筑：从原始 GeoJSON 独立计算，避免测试/部署的共享可变状态。"""
     def _load():
         out = []
         p = os.path.join(ROOT, "gz_tower_buildings.geojson")
@@ -328,15 +318,29 @@ def _get_buildings():
                 g = feat.get("geometry")
                 if not g or not g.get("coordinates"):
                     continue
-                ring = g["coordinates"][0]
-                lon = sum(pt[0] for pt in ring) / len(ring)
-                lat = sum(pt[1] for pt in ring) / len(ring)
+                polys = [g["coordinates"]] if g.get("type") == "Polygon" else g["coordinates"] if g.get("type") == "MultiPolygon" else []
+                pieces = []
+                for polygon in polys:
+                    if not polygon or len(polygon[0]) < 3:
+                        continue
+                    outer = polygon[0]
+                    centre = (sum(pt[0] for pt in outer) / len(outer), sum(pt[1] for pt in outer) / len(outer))
+                    area = _ring_area_m2(outer, centre[1])
+                    for hole in polygon[1:]:
+                        if len(hole) >= 3:
+                            area -= _ring_area_m2(hole, centre[1])
+                    pieces.append((centre, area))
+                if not pieces:
+                    continue
+                total = sum(piece[1] for piece in pieces)
+                lon = sum(piece[0][0] * piece[1] for piece in pieces) / total if total > 0 else pieces[0][0][0]
+                lat = sum(piece[0][1] * piece[1] for piece in pieces) / total if total > 0 else pieces[0][0][1]
                 pr = feat.get("properties", {}) or {}
                 name = pr.get("name") or ""
                 h = float(pr.get("height") or 0)
                 out.append({"name": name, "lon": float(lon),
                             "lat": float(lat), "height_m": h,
-                            "area_m2": round(_ring_area_m2(ring, lat), 1),
+                            "area_m2": round(total, 1),
                             "btype": _building_type(name, h)})
         return out
     return _bld_m.get_or_compute("bld", _load)
@@ -416,7 +420,7 @@ def _sample_grid(arr, transform, lon, lat):
     用 floor 而非 int()(int 向零截断, 负坐标 -0.5 会回绕成 0 造成假命中)。"""
     try:
         inv = ~transform
-        col, row = inv * (lon, lat)
+        col, row = inv @ (lon, lat)
     except Exception:
         return None
     r, c = int(math.floor(row)), int(math.floor(col))
@@ -550,15 +554,33 @@ def _artifact(rel):
     return os.path.exists(os.path.join(ROOT, rel))
 
 
+_db_health_cache = None
+
+
 def _db_reachable():
-    if psycopg2 is None:
-        return False
-    try:
-        with get_conn() as c:
-            c.cursor().execute("SELECT 1")
-        return True
-    except Exception:
-        return False
+    global _db_health_cache
+    now = time.monotonic()
+    if _db_health_cache is not None and now - _db_health_cache[0] < 15:
+        return _db_health_cache[1]
+    result = False
+    if psycopg2 is not None:
+        try:
+            with closing(get_conn()) as conn, conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            result = True
+        except Exception:
+            _log.warning("PostGIS 健康探活失败", exc_info=True)
+    _db_health_cache = (now, result)
+    return result
+
+
+def _query_db(sql, params=()):
+    """有连接超时与语句超时；连接和游标均在 finally 中关闭。"""
+    with closing(get_conn()) as conn, conn.cursor() as cursor:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        columns = [column[0] for column in cursor.description]
+    return columns, rows
 
 
 @app.get("/api/health", tags=["系统"])
@@ -575,7 +597,8 @@ def health():
         "db_reachable": _db_reachable(), "db_first": _db_first(),
         "scenarios_source": _state.get("scenarios_source", "file"),
         "db_fallbacks": _state.get("db_fallbacks", 0),
-        "store_quarantines": _state_quarantines[0],
+        "store_quarantines": __import__("store")._state_quarantines[0],
+        "rate_keys": len(__import__("store")._report_rl),
         "artifacts": {
             "design_storm_24h": _artifact(os.path.join("flood_out", "design_storm_24h.json")),
             "flood_tiles": _artifact(os.path.join("flood_out", "flood_tiles", "meta.json")),
@@ -616,16 +639,14 @@ def scenarios():
     base = None
     if _db_first():
         try:
-            with get_conn() as c, c.cursor() as cur:
-                cur.execute("""SELECT return_period_y, rain_mm, runoff_depth_m, water_level_m,
+            cols, rows = _query_db("""SELECT return_period_y, rain_mm, runoff_depth_m, water_level_m,
                                       max_depth_m, mean_depth_m, flooded_area_km2, flooded_cells, river_cells
                                FROM flood_scenarios ORDER BY return_period_y""")
-                cols = [d[0] for d in cur.description]
-                base = [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
-                source = "postgis"
+            base = [dict(zip(cols, row, strict=False)) for row in rows]
+            source = "postgis"
         except Exception as e:
             _log.warning("PostGIS flood_scenarios 查询失败, 回退本地文件: %s", e)
-            _state["db_fallbacks"] += 1
+            _mark_db_fallback()
             base = None
     if base is None:
         # 本地文件(与 pipeline/bathtub_flood.py 重算产物同源)
@@ -654,17 +675,16 @@ def scenarios():
 def flood_extent(return_period: int = Query(100, ge=2, le=100)):
     if _db_first():
         try:
-            with get_conn() as c, c.cursor() as cur:
-                cur.execute("SELECT ST_AsGeoJSON(geom) FROM flood_extent WHERE return_period_y=%s",
-                            (return_period,))
-                feats = [{"type": "Feature", "geometry": json.loads(r[0]), "properties": {}}
-                         for r in cur.fetchall()]
+            _, rows = _query_db("SELECT ST_AsGeoJSON(geom) FROM flood_extent WHERE return_period_y=%s",
+                                (return_period,))
+            feats = [{"type": "Feature", "geometry": json.loads(row[0]), "properties": {}}
+                     for row in rows]
             if feats:
                 _state["scenarios_source"] = "postgis"
                 return {"type": "FeatureCollection", "features": feats, "source": "postgis"}
         except Exception as e:
             _log.warning("PostGIS flood_extent(T=%s) 查询失败, 回退本地文件: %s", return_period, e)
-            _state["db_fallbacks"] += 1
+            _mark_db_fallback()
     # 本地 geojson(与 pipeline/bathtub_flood.py 重算产物同源; 只有 2/5/10/50/100 五档, 其余重现期 404)
     p = os.path.join(ROOT, "flood_out", "flood_extent_%dy.geojson" % return_period)
     if not os.path.exists(p):
@@ -997,6 +1017,9 @@ def realevent_extent(event: str = Query(None)):
 
 
 MAX_PREDICT_BYTES = 64 * 1024 * 1024
+MAX_PREDICT_PIXELS = 2048 * 2048
+MAX_PREDICT_DECODE_BYTES = 128 * 1024 * 1024
+_predict_slots = threading.BoundedSemaphore(2)
 
 
 def _read_capped(stream, cap=MAX_PREDICT_BYTES):
@@ -1026,12 +1049,28 @@ def predict(request: Request, file: UploadFile = File(...)):
         return JSONResponse({"error": "模型尚未训练完成"}, status_code=503)
     try:
         data = _read_capped(file.file)
-        I = tifffile.imread(io.BytesIO(data)).astype(np.float32)
-        if I.ndim == 3 and I.shape[0] == 5 and I.shape[2] != 5:
-            I = I.transpose(1, 2, 0)          # (C,H,W) 波段前置 → (H,W,C)
-        if I.ndim != 3 or I.shape[2] < 5:
-            return JSONResponse({"error": "输入应为 5 波段影像 (H,W,5) 或 (5,H,W)"}, status_code=400)
-        mask = predict_mask(I[..., :5], 128, ckpt_path=ckpt)
+        if not _predict_slots.acquire(blocking=False):
+            raise HTTPException(503, "推理任务繁忙，请稍后重试")
+        try:
+            with tifffile.TiffFile(io.BytesIO(data)) as tf:
+                if not tf.series:
+                    raise HTTPException(400, "TIFF 中没有影像")
+                series = tf.series[0]
+                shape = series.shape
+                if len(shape) != 3 or (shape[-1] != 5 and shape[0] != 5):
+                    raise HTTPException(400, "输入应为 5 波段影像 (H,W,5) 或 (5,H,W)")
+                height, width = shape[:2] if shape[-1] == 5 else shape[1:]
+                if (height * width > MAX_PREDICT_PIXELS or
+                        math.prod(shape) * (series.dtype.itemsize + 4) > MAX_PREDICT_DECODE_BYTES):
+                    raise HTTPException(413, "影像像素或解码内存超过上限")
+                I = series.asarray().astype(np.float32, copy=False)
+            if I.shape[-1] != 5:
+                I = I.transpose(1, 2, 0)
+            if not np.isfinite(I).all():
+                raise HTTPException(400, "影像包含非有限数值")
+            mask = predict_mask(I, 128, ckpt_path=ckpt)
+        finally:
+            _predict_slots.release()
         buf = io.BytesIO()
         Image.fromarray(mask, "L").save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
@@ -1046,31 +1085,29 @@ def predict(request: Request, file: UploadFile = File(...)):
 
 # ==== 用户认证(轻量: 文件用户表 + 内存 token, 管理员/公众两角色) ====
 _tokens = {}   # token -> {username, role, ts}
+_tokens_lock = threading.RLock()
 
 
 def _gc_tokens():
-    """过期 token 清扫(2026-10 审计 BE-02: 旧实现只在"本人再次携带"时删除, 只增不减)。
-    登录时顺带触发: 先清 12h 过期项, 仍超硬上限则按插入序截断最旧。"""
-    if len(_tokens) < 512:
-        return
-    now = time.time()
-    for k in [k for k, v in _tokens.items() if now - v["ts"] > 12 * 3600]:
-        _tokens.pop(k, None)
-    if len(_tokens) > 4096:                       # 硬上限(防脚本循环登录撑内存)
-        for k in sorted(_tokens, key=lambda k: _tokens[k]["ts"])[:len(_tokens) - 4096]:
-            _tokens.pop(k, None)
+    """会话清扫与登录写入共享锁；保留最多 4096 个活跃会话。"""
+    with _tokens_lock:
+        now = time.time()
+        expired = [k for k, v in _tokens.items() if now - v["ts"] > 12 * 3600]
+        for key in expired:
+            _tokens.pop(key, None)
+        for key in sorted(_tokens, key=lambda k: _tokens[k]["ts"])[:max(0, len(_tokens) - 4096)]:
+            _tokens.pop(key, None)
 
 
 def _current_user(req_token):
-    if not req_token:
-        return None
-    t = _tokens.get(req_token)
-    if not t:
-        return None
-    if time.time() - t["ts"] > 12 * 3600:   # 12h 过期
-        _tokens.pop(req_token, None)
-        return None
-    return {"username": t["username"], "role": t["role"]}
+    with _tokens_lock:
+        t = _tokens.get(req_token) if req_token else None
+        if not t:
+            return None
+        if time.time() - t["ts"] > 12 * 3600:
+            _tokens.pop(req_token, None)
+            return None
+        return {"username": t["username"], "role": t["role"]}
 
 
 def _require_admin(req_token):
@@ -1093,6 +1130,23 @@ def _token_from(request, query_token):
     return query_token
 
 
+def _local_demo_request(request):
+    import ipaddress
+    host = request.client.host if request.client else ""
+    if host == "testclient":
+        return True  # ASGI TestClient，无真实网络对端
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@app.get("/api/auth/config")
+def auth_config(request: Request):
+    import store
+    return {"demo": store.demo_enabled() and _local_demo_request(request)}
+
+
 @app.post("/api/auth/login")
 def auth_login(request: Request, payload: dict = Body(...)):
     uname = str(payload.get("username", "")).strip()
@@ -1103,17 +1157,32 @@ def auth_login(request: Request, payload: dict = Body(...)):
         return JSONResponse({"error": "尝试过于频繁, 请 1 分钟后再试"}, status_code=429)
     if not _rate_ok("login_ip:" + _client_ip(request), limit=30, window=60.0):
         return JSONResponse({"error": "尝试过于频繁, 请 1 分钟后再试"}, status_code=429)
+    import store
+    if len(uname) > 120 or len(pw) > 1024:
+        return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+    if store.demo_enabled() and not _local_demo_request(request):
+        return JSONResponse({"error": "演示账号仅限本机访问"}, status_code=403)
     users = _load_users()
-    for i, u in enumerate(users):
-        if u["username"] == uname and _verify_pw(pw, u):
-            _upgrade_pw(users, i, pw)   # 旧 sha256 单轮哈希 → PBKDF2(登录即升级, 幂等)
-            _gc_tokens()
-            tok = uuid.uuid4().hex
-            _tokens[tok] = {"username": uname, "role": u["role"], "ts": time.time()}
-            exp = (datetime.datetime.now() + datetime.timedelta(hours=12)).strftime("%Y-%m-%d %H:%M")
-            return {"token": tok, "username": uname, "role": u["role"],
-                    "expires_at": exp, "expires_in_hours": 12}
-    return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+    found = next(((i, user) for i, user in enumerate(users) if user["username"] == uname), None)
+    if found is None:
+        store._hash_pw(pw, "unknownuserdummysalt")  # 与 PBKDF2 用户错误口令等价工作量
+        return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+    i, user = found
+    verified = _verify_pw(pw, user)
+    if not str(user.get("hash", "")).startswith("pbkdf2$"):
+        store._hash_pw(pw, "legacy-user-dummy-salt")
+    if not verified:
+        return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+    if not store.demo_enabled() and pw in ("admin123", "123456"):
+        return JSONResponse({"error": "该账号仍使用演示口令，请维护者重设口令"}, status_code=503)
+    _upgrade_pw(users, i, pw)
+    with _tokens_lock:
+        tok = uuid.uuid4().hex
+        _tokens[tok] = {"username": uname, "role": user["role"], "ts": time.time()}
+        _gc_tokens()
+    exp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=12)).isoformat()
+    return {"token": tok, "username": uname, "role": user["role"],
+            "expires_at": exp, "expires_in_hours": 12}
 
 
 @app.get("/api/auth/me")
@@ -1126,7 +1195,8 @@ def auth_me(request: Request, token: str = Query(None)):
 
 @app.post("/api/auth/logout")
 def auth_logout(payload: dict = Body(...)):
-    _tokens.pop(str(payload.get("token", "")), None)
+    with _tokens_lock:
+        _tokens.pop(str(payload.get("token", "")), None)
     return {"ok": True}
 
 
@@ -1205,7 +1275,7 @@ def _compute_warning(z, depth, label):
         "flooded_area_km2": area_km2,
         "zones": zones,
         "message": "珠江新城片区分级预警: %s" % (city if city != "无" else "无预警"),
-        "published_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "published_at": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
         "thresholds": "城区: 淹没面积≥0.6/1.0/1.3/1.6km² → 蓝/黄/橙/红; 分区: 淹没占比≥3%/8%/14%/20%",
         "note": "预警等级由淹没模拟结果自动分级, 供演示。真实业务需衔接三防部门发布流程。",
     }
@@ -1216,7 +1286,7 @@ def warning(return_period: int = Query(100, ge=2, le=100)):
     key = ("T", return_period)
     if key in _warn_cache:
         w = dict(_warn_cache[key])
-        w["published_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # 缓存命中也用新鲜发布时间
+        w["published_at"] = _now_cn().strftime("%Y-%m-%d %H:%M:%S")   # 缓存命中也用新鲜发布时间
     else:
         d = _load_depth_tif(return_period)
         if d is None:
@@ -1232,18 +1302,8 @@ def warning(return_period: int = Query(100, ge=2, le=100)):
         w["notify"] = {"subscribers": len(subs),
                        "channel": ("企业微信+邮件" if (WECOM_WEBHOOK_URL or SMTP_CFG["host"]) else "邮件(演示登记, 未真实发送)"),
                        "note": "橙/红预警触发订阅触达; 正式业务接入短信网关"}
-        if (WECOM_WEBHOOK_URL or SMTP_CFG["host"]) and \
-                notify_due(_NOTIFY_STATE, "T%s:%s" % (return_period, w["city_level"])):
-            zone_txt = "; ".join("区%d(%s %.0f%%)" % (z0["zone"], z0["level"], z0["ratio_pct"])
-                                 for z0 in w["zones"] if z0["level"] != "无") or "各区均低于蓝色阈值"
-            md = ("**洪涝预警(%s)**\n> 珠江新城 %s\n> 淹没面积 **%.2f km²**\n> 建议: %s\n> 高风险分区: %s"
-                  % (w["city_level"], w["scenario"], w["flooded_area_km2"], w["advice"], zone_txt))
-            body = ("珠江新城 %s 洪涝预警\n等级: %s\n淹没面积: %.2f km²\n建议: %s\n高风险分区: %s"
-                    % (w["scenario"], w["city_level"], w["flooded_area_km2"], w["advice"], zone_txt))
-            notify_async(WECOM_WEBHOOK_URL, SMTP_CFG,
-                         "[C2132预警] %s %s预警" % (w["scenario"], w["city_level"]),
-                         md, body, [s["email"] for s in subs])
-            w["notify"]["sent"] = True
+        w["notify"]["note"] = "仅展示预警；通知须由管理员显式发布，且仅发往已确认的相应分区订阅"
+        w["notify"]["sent"] = False
     return w
 
 
@@ -1402,7 +1462,7 @@ def _evacuation_build(return_period, max_routes, d):
     cell_m = cell_area_m2(transform) ** 0.5
 
     def cell_of(lon, lat):
-        c, r = inv * (lon, lat)
+        c, r = inv @ (lon, lat)
         return int(r), int(c)
 
     def island_of(lon, lat):
@@ -1455,7 +1515,7 @@ def _evacuation_build(return_period, max_routes, d):
                 pts.append(path[-1])
             pts_t = []
             for r, c in pts:
-                lon, lat = transform * (c + 0.5, r + 0.5)
+                lon, lat = transform @ (c + 0.5, r + 0.5)
                 pts_t.append([round(float(lon), 6), round(float(lat), 6)])
             routes.append({
                 "from": {"lon": h["lon"], "lat": h["lat"],
@@ -1631,7 +1691,7 @@ def _theme_decorate(draw, map_l, map_t, map_r, map_b, mw, mh, product, return_pe
             os.path.getmtime(os.path.join(ROOT, "flood_out", "flood_depth_%dy.tif" % return_period))
         ).strftime("%Y-%m-%d %H:%M")
     except OSError:
-        gen_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        gen_at = _now_cn().strftime("%Y-%m-%d %H:%M")
     draw.text((map_l, map_b + 16), "制图: 浴缸法体积注水反演(仅陆域, 排除珠江河道) · 数据: 情景模拟结果, 仅供演示 · 结果生成: " + gen_at,
               font=f_sm, fill="#627d98")
     draw.text((map_l, map_b + 38), "坐标系: WGS84 经纬度 · 分区: 3×3 网格 · 深色为珠江河道掩膜区", font=f_sm, fill="#9fb3c8")
@@ -1734,7 +1794,7 @@ def _theme_map_png(return_period, title, product, d, z, transform):
 
 
 @app.get("/api/thematic_map", tags=["专题图"])
-def thematic_map(return_period: int = Query(100, ge=2, le=100),
+def thematic_map(request: Request, return_period: int = Query(100, ge=2, le=100),
                  title: str = Query(None, max_length=60),
                  product: str = Query("extent", pattern="^(extent|facilities|hazard)$")):
     """Copernicus EMS 风格专题图产品系列(map series):
@@ -1742,15 +1802,21 @@ def thematic_map(return_period: int = Query(100, ge=2, le=100),
     三种产品共用一套制图模板(标题块/3×3分区/指北针/比例尺/图例/落款), 成套交付。
     缓存前置(命中不读栅格); 自定义标题不进缓存(key 含用户输入, 防缓存膨胀)。
     渲染逻辑在 _theme_map_png 及其 5 个 _theme_* 辅助函数。"""
-    key = (return_period, product)
-    if not title and key in _theme_cache:
+    if not _rate_ok("theme:" + _client_ip(request), limit=10):
+        raise HTTPException(429, "专题图渲染过于频繁")
+    if title and any(ord(char) < 32 or ord(char) == 127 for char in title):
+        raise HTTPException(400, "标题含控制字符")
+    key = (return_period, product, title)
+    if key in _theme_cache:
         return Response(content=_theme_cache[key], media_type="image/png")
     d = _load_depth_tif(return_period)
     if d is None:
         return JSONResponse({"error": "无 %d 年水深栅格" % return_period}, status_code=404)
     z, transform = _get_dtm()
     png = _theme_map_png(return_period, title, product, d, z, transform)
-    if not title:
+    with threading.Lock():
+        if len(_theme_cache) >= 64:
+            _theme_cache.pop(next(iter(_theme_cache)))
         _theme_cache[key] = png
     return Response(content=png, media_type="image/png")
 
@@ -1761,15 +1827,31 @@ _STATIONS = [("猎德大道站", 113.3230, 23.1125), ("花城大道站", 113.329
              ("员村站", 113.3420, 23.1135)]
 
 
-def _om_now_index(om):
-    """Open-Meteo 返回含 past_days 历史 + forecast_days 未来; 以当前整点定位分界。"""
-    now_key = datetime.datetime.now().strftime("%Y-%m-%dT%H:00")
-    idx = len(om["times"]) - 1
-    for i, t in enumerate(om["times"]):
-        if t >= now_key:
-            idx = i
-            break
-    return idx
+_CN_TZ = datetime.timezone(datetime.timedelta(hours=8), "Asia/Shanghai")
+
+
+def _now_cn():
+    return datetime.datetime.now(_CN_TZ)
+
+
+def _om_now_index(om, now=None):
+    """气象源时间为上海当地时刻，不能依赖服务器（容器通常 UTC）时区。"""
+    from bisect import bisect_right
+    current = now if now is not None else _now_cn()
+    if current.tzinfo is None:
+        raise ValueError("当前时刻必须包含时区")
+    now_key = current.astimezone(_CN_TZ).strftime("%Y-%m-%dT%H:00")
+    if not om.get("times"):
+        raise ValueError("气象时间序列为空")
+    return max(0, min(len(om["times"]) - 1, bisect_right(om["times"], now_key) - 1))
+
+
+def _intensity_level(last1):
+    for threshold, level, advice in [(16, "暴雨", "注意城区积涝"), (8, "大雨", "出行请避开易涝路段"),
+                                      (2.5, "中雨", "降雨持续, 关注预警"), (0.1, "小雨", "无积涝风险")]:
+        if last1 >= threshold:
+            return level, advice
+    return "无雨", "天气平静"
 
 
 def _realtime_rain_payload(om):
@@ -1784,19 +1866,10 @@ def _realtime_rain_payload(om):
         acc = min(200.0, max(0.0, sum(past) * jitter))
         stations.append({"name": name, "lon": lon, "lat": lat,
                          "hour_rain_mm": round(h1, 1), "rain24h_mm": round(acc, 1)})
-    trend = [{"hour": (datetime.datetime.now() - datetime.timedelta(hours=11 - i)).strftime("%H:%M"),
+    trend = [{"hour": (_now_cn() - datetime.timedelta(hours=11 - i)).strftime("%H:%M"),
               "mm": round(v, 1)} for i, v in enumerate(past[-12:])]
-    if last1 >= 16:
-        level, advice = "暴雨", "注意城区积涝"
-    elif last1 >= 8:
-        level, advice = "大雨", "出行请避开易涝路段"
-    elif last1 >= 2.5:
-        level, advice = "中雨", "降雨持续, 关注预警"
-    elif last1 >= 0.1:
-        level, advice = "小雨", "无积涝风险"
-    else:
-        level, advice = "无雨", "天气平静"
-    return {"updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    level, advice = _intensity_level(last1)
+    return {"updated_at": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
             "slot_minutes": 10,
             "city_hour_rain_mm": round(last1, 1),
             "city_rain24h_mm": round(sum(past), 1),
@@ -1832,19 +1905,10 @@ def realtime_rain():
                          "hour_rain_mm": max(0.0, h1), "rain24h_mm": max(0.0, acc)})
     last1 = hours[-1]
     # 最近 12 小时趋势: hours[-12:] 对应 now-11h..now, 标签须与值同时序
-    trend = [{"hour": (datetime.datetime.now() - datetime.timedelta(hours=11 - i)).strftime("%H:%M"),
+    trend = [{"hour": (_now_cn() - datetime.timedelta(hours=11 - i)).strftime("%H:%M"),
               "mm": round(v, 1)} for i, v in enumerate(hours[-12:])]
-    if last1 >= 16:
-        level, advice = "暴雨", "注意城区积涝"
-    elif last1 >= 8:
-        level, advice = "大雨", "出行请避开易涝路段"
-    elif last1 >= 2.5:
-        level, advice = "中雨", "降雨持续, 关注预警"
-    elif last1 >= 0.1:
-        level, advice = "小雨", "无积涝风险"
-    else:
-        level, advice = "无雨", "天气平静"
-    return {"updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    level, advice = _intensity_level(last1)
+    return {"updated_at": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
             "slot_minutes": 10, "city_hour_rain_mm": round(last1, 1),
             "city_rain24h_mm": round(sum(hours), 1),
             "intensity_level": level, "advice": advice,
@@ -1896,7 +1960,7 @@ def forecast_flood(request: Request, c: float = Query(RUNOFF_COEF, ge=0.05, le=0
                 feats.append({"type": "Feature", "geometry": g,
                               "properties": {"W": round(float(l["W_m"]), 2)}})
     return {"source": "open-meteo(GFS/ICON) 72h 逐时降雨预报", "c": round(c, 2),
-            "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "fetched_at": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
             "series": series,
             "worst_t_h": worst["t_h"],
             "extent": {"type": "FeatureCollection", "features": feats},
@@ -2230,37 +2294,50 @@ def report_create(request: Request, payload: dict = Body(...)):
             lat = float(payload["lat"]) if payload.get("lat") is not None else None
         except (TypeError, ValueError):
             return JSONResponse({"error": "经纬度格式不正确"}, status_code=400)
+        if ((lon is None) != (lat is None) or
+                (lon is not None and (not math.isfinite(lon) or not math.isfinite(lat)
+                                      or not -180 <= lon <= 180 or not -90 <= lat <= 90))):
+            return JSONResponse({"error": "经纬度必须为有效的有限地理坐标"}, status_code=400)
+        if any(not isinstance(payload.get(key, ""), str) for key in ("location_text", "depth_est", "desc")):
+            return JSONResponse({"error": "文本字段必须为字符串"}, status_code=400)
         item = {"lon": lon, "lat": lat,
                 "location_text": _clean_text(payload.get("location_text", ""), 120),
                 "category": cat,
                 "depth_est": _clean_text(payload.get("depth_est", ""), 20),
                 "desc": _clean_text(payload.get("desc", ""), 300),
                 "status": "待核实",
-                "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                "created_at": _now_cn().strftime("%Y-%m-%d %H:%M:%S")}
         img = payload.get("image") or ""
-        img_data = None
-        if isinstance(img, str) and img.startswith("data:image") and "," in img and len(img) < 3_500_000:
+        image_bytes = None
+        if img:
+            if not isinstance(img, str) or not img.startswith("data:image/") or "," not in img or len(img) >= 3_500_000:
+                return JSONResponse({"error": "照片格式不正确或文件过大"}, status_code=400)
             try:
-                img_data = base64.b64decode(img.split(",", 1)[1])
-            except Exception:
-                img_data = None
-        # 读-改-写全程持 _report_lock: 并发提交不丢记录、不撞 id
-        # (照片 CPU 解码在锁外, 仅文件落盘在锁内)
+                raw = base64.b64decode(img.split(",", 1)[1], validate=True)
+                with Image.open(io.BytesIO(raw)) as photo:
+                    if photo.width * photo.height > 20_000_000 or max(photo.size) > 6000:
+                        return JSONResponse({"error": "照片像素超过上限"}, status_code=400)
+                    with photo.convert("RGB") as rgb:
+                        output = io.BytesIO()
+                        rgb.save(output, format="JPEG")
+                        image_bytes = output.getvalue()
+            except (ValueError, OSError, Image.DecompressionBombError):
+                return JSONResponse({"error": "照片无效或尺寸过大"}, status_code=400)
+        # 解码在锁外，读改写在锁内。容量满时拒绝新记录，不静默丢弃旧报汛。
         with _report_lock:
             lst = _load_reports()
+            if len(lst) >= 1000:
+                return JSONResponse({"error": "报汛容量已满，请维护者归档后重试"}, status_code=409)
             rid = "r" + uuid.uuid4().hex[:12]
             item["id"] = rid
-            if img_data is not None:
-                try:
-                    ext = ".jpg" if "jpeg" in img[:32] else ".png"
-                    fn = "img_%s%s" % (rid, ext)
-                    Image.open(io.BytesIO(img_data)).convert("RGB").save(os.path.join(_REPORT_DIR, fn))
-                    item["image"] = fn
-                except Exception as e:
-                    _log.warning("报汛 %s 照片解码/保存失败(其余字段已入库): %s", rid, e)
-                    item["image_error"] = "照片保存失败, 其余信息已提交"
+            if image_bytes is not None:
+                os.makedirs(_REPORT_DIR, exist_ok=True)
+                fn = "img_%s.jpg" % rid
+                with open(os.path.join(_REPORT_DIR, fn), "wb") as photo_file:
+                    photo_file.write(image_bytes)
+                item["image"] = fn
             lst.insert(0, item)
-            _save_reports(lst[:1000])   # 上限放宽到 1000, 避免静默丢报汛
+            _save_reports(lst)
         return {"ok": True, "id": rid, "item": item}
     except RuntimeError as e:
         # 报讯 store 受损(降级写回保护拒绝覆盖) → 503, 现场可立刻识别是存储问题
@@ -2271,29 +2348,48 @@ def report_create(request: Request, payload: dict = Body(...)):
         # 伪装成 400 会让用户误判"字段格式问题"且无法重试(2026-10 审计 REL-01)
         _log.error("报讯写盘失败(系统级, ip=%s): %s", _client_ip(request), e)
         return JSONResponse({"error": "服务暂时无法保存报讯, 请稍后重试"}, status_code=503)
-    except Exception as e:
-        try:
-            prev = {k: str(v)[:40] for k, v in list(payload.items())[:6]}
-        except Exception:
-            prev = {}
-        _log.warning("报汛提交被拒(ip=%s): %s | payload=%s",
-                     _client_ip(request), e, prev)
-        return JSONResponse({"error": "提交失败: 请检查字段格式"}, status_code=400)
+    except Exception:
+        # 未预期缺陷交给统一异常处理；不记录位置、描述或照片等自由文本。
+        raise
 
 
 @app.get("/api/report", tags=["公众报汛"])
-def report_list(limit: int = Query(50, ge=1, le=200), status: str = Query(None)):
-    """公众上报列表; status 参数可过滤(如 status=已核实 供三维场景上图)。
-    total 为过滤后总数(切片前统计), 分页语义正确。"""
+def report_list(request: Request, limit: int = Query(50, ge=1, le=200), status: str = Query(None)):
+    """公众仅查看审核后的摘要；管理员通过请求头查看完整待核实记录。"""
+    admin = _require_admin(_token_from(request, None))
     lst = _load_reports()
+    if not admin:
+        lst = [x for x in lst if x.get("status") in ("已核实", "已处理")]
     if status:
         lst = [x for x in lst if x.get("status") == status]
     total = len(lst)
-    lst = lst[:limit]
-    for it in lst:
-        if it.get("image"):
-            it["image_url"] = "/reports/" + it["image"]
-    return {"reports": lst, "total": total}
+    rows = []
+    for item in lst[:limit]:
+        if admin:
+            row = dict(item)
+            if row.get("image"):
+                row["image_url"] = "/reports/" + row["image"]
+        else:
+            row = {key: item.get(key) for key in ("id", "category", "status", "depth_est", "created_at")}
+            for key in ("lon", "lat"):
+                value = item.get(key)
+                row[key] = round(value, 3) if isinstance(value, (int, float)) and math.isfinite(value) else None
+        rows.append(row)
+    return {"reports": rows, "total": total}
+
+
+@app.get("/reports/{filename}", include_in_schema=False)
+def report_photo(filename: str, request: Request):
+    if not _require_admin(_token_from(request, None)):
+        raise HTTPException(401, "照片仅管理员可查看")
+    if not re.fullmatch(r"img_[A-Za-z0-9_-]+\.(jpg|png|jpeg)", filename):
+        raise HTTPException(404, "照片不存在")
+    from pathlib import Path
+    base = Path(_REPORT_DIR).resolve()
+    path = (base / filename).resolve()
+    if path.parent != base or not path.is_file():
+        raise HTTPException(404, "照片不存在")
+    return FileResponse(path)
 
 
 @app.post("/api/report/{rid}/status", tags=["公众报汛"])
@@ -2330,20 +2426,82 @@ def subscribe(request: Request, payload: dict = Body(...)):
     zone = _clean_text(str(payload.get("zone", "全部")).strip(), 20) or "全部"
     if not _EMAIL_RE.fullmatch(email):
         return JSONResponse({"error": "邮箱格式不正确"}, status_code=400)
-    with _subscribers_lock:
-        subs = _load_subscribers()
-        for s in subs:
-            if s["email"] == email:
-                s["zone"] = zone
-                break
-        else:
-            if len(subs) >= SUBSCRIBER_CAP:
-                return JSONResponse({"error": "订阅数已达上限"}, status_code=409)
-            subs.append({"email": email, "zone": zone,
-                         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-        _save_subscribers(subs)
-    return {"ok": True, "total": len(subs),
-            "note": "已登记; 演示环境不发送真实邮件, 预警触发时在 /api/warning 返回触达统计"}
+    from subscription_service import normalize_zone, prepare_registration, public_base_url
+    import store
+    import hashlib
+    try:
+        zone = normalize_zone(zone)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    address_key = hashlib.sha256(email.casefold().encode()).hexdigest()
+    if not _rate_ok("sub_email:" + address_key, limit=2, window=600):
+        return {"ok": True, "note": "如地址可接收确认邮件，请查收；确认后订阅才生效"}
+    base = None
+    if SMTP_CFG.get("host") and not store.demo_enabled():
+        try:
+            base = public_base_url(os.environ.get("PUBLIC_BASE_URL", ""))
+        except ValueError as exc:
+            raise HTTPException(503, str(exc)) from exc
+    try:
+        confirm, unsubscribe = prepare_registration(email, zone)
+    except OverflowError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if base:
+        body = ("请确认您的洪涝预警订阅（24小时内有效）。若非本人操作，请忽略。\n"
+                + base + "/subscription.html#confirm=" + confirm
+                + "\n确认后可通过此链接退订：\n" + base + "/subscription.html#unsubscribe=" + unsubscribe)
+        notify_async("", SMTP_CFG, "确认洪涝预警订阅", "", body, [email])
+    return {"ok": True, "note": "已登记为待确认；如地址可接收确认邮件，请查收。未配置邮件或演示模式不会真实发送"}
+
+
+@app.post("/api/subscribe/confirm", tags=["订阅预警"])
+def subscribe_confirm(request: Request, payload: dict = Body(...)):
+    from subscription_service import consume_token
+    if not _rate_ok("confirm:" + _client_ip(request), limit=20):
+        raise HTTPException(429, "请求过于频繁")
+    if not consume_token(payload.get("token")):
+        raise HTTPException(400, "确认链接无效或已过期")
+    return {"ok": True, "note": "订阅已确认"}
+
+
+@app.post("/api/subscribe/unsubscribe", tags=["订阅预警"])
+def unsubscribe(request: Request, payload: dict = Body(...)):
+    from subscription_service import consume_token
+    if not _rate_ok("unsubscribe:" + _client_ip(request), limit=20):
+        raise HTTPException(429, "请求过于频繁")
+    if not consume_token(payload.get("token"), unsubscribe=True):
+        raise HTTPException(400, "退订链接无效")
+    return {"ok": True, "note": "已退订"}
+
+
+@app.post("/api/warning/publish", tags=["预警发布"])
+def warning_publish(request: Request, payload: dict = Body(...)):
+    from subscription_service import confirmed_recipients
+    user = _require_admin(_token_from(request, None))
+    if not user:
+        raise HTTPException(401, "需要管理员登录")
+    if not _rate_ok("publish:" + _client_ip(request), limit=5):
+        raise HTTPException(429, "发布过于频繁")
+    period = payload.get("return_period", 100)
+    if type(period) is not int or period not in RETURNS:
+        raise HTTPException(400, "不支持的重现期")
+    data = warning(return_period=period)
+    if isinstance(data, Response):
+        return data
+    if _WARN_RANK.get(data.get("city_level"), 0) < 2:
+        return {"queued": False, "sent": False, "reason": "未达到通知阈值"}
+    if not WECOM_WEBHOOK_URL and not SMTP_CFG.get("host"):
+        return {"queued": False, "sent": False, "reason": "未配置通知渠道"}
+    recipients = confirmed_recipients(data, _load_subscribers())
+    zones = ",".join(str(z["zone"]) for z in data.get("zones", []) if z.get("level") != "无")
+    if not notify_due(_NOTIFY_STATE, "T%s:%s:%s" % (period, data["city_level"], zones)):
+        return {"queued": False, "sent": False, "reason": "相同预警仍在冷却期或状态存储不可用"}
+    subject = "[C2132预警] %s %s" % (data["scenario"], data["city_level"])
+    body = "%s\n淹没面积 %.2f km²\n建议：%s\n关注分区：%s" % (subject, data["flooded_area_km2"], data["advice"], zones)
+    result = notify_async(WECOM_WEBHOOK_URL, SMTP_CFG, subject, body, body, recipients)
+    _log.info("管理员发布预警 period=%s queued=%s targets=%s", period, result.get("queued"), len(recipients))
+    return {"queued": bool(result.get("queued")), "sent": False,
+            "reason": result.get("reason", ""), "note": "入队不代表送达，实际渠道结果记录于服务日志"}
 
 
 @app.get("/api/subscribe", tags=["订阅预警"])
@@ -2354,7 +2512,7 @@ def subscribe_list(request: Request, token: str = Query(None)):
 
 
 # ==== 集合预报(对标§四5): 多参数蒙特卡洛 → 逐格淹没概率场 ====
-_ens_m = _Memo()
+_ens_m = _Memo(limit=32)
 _C_LO, C_HI = 0.05, 0.95          # 径流系数采样钳位(与端点校验口径一致)
 
 
@@ -2397,11 +2555,13 @@ def _ensemble_core(T, n=24):
 
 
 @app.get("/api/ensemble", tags=["情景与栅格"])
-def ensemble(return_period: int = Query(100, ge=2, le=100),
+def ensemble(request: Request, return_period: int = Query(100, ge=2, le=100),
              n: int = Query(24, ge=6, le=96)):
     """集合不确定性(对标§四5, GloFAS 概率制图思路): 设计暴雨±20% × C±0.07 的确定性
     蒙特卡洛成员 → 逐格淹没概率/水位分位数/淹没面积区间(把单一 ±20% 敏感性带升级为
     概率场); 概率栅格可视化见 /api/ensemble_png。"""
+    if not _rate_ok("ensemble:" + _client_ip(request), limit=6):
+        raise HTTPException(429, "请求过于频繁")
     d = _load_depth_tif(return_period)
     if d is None:
         return JSONResponse({"error": "无 %d 年水深栅格" % return_period}, status_code=404)
@@ -2440,7 +2600,7 @@ def _ogc_link(href, rel, ftype="application/json", title=""):
 @app.get("/api/ogc", tags=["OGC"])
 def ogc_landing(request: Request):
     """OGC API – Features Part 1 入口(landing)。互操作生命线: 标准客户端可发现并遍历集合。"""
-    base = str(request.base_url).rstrip("/") + "/api/ogc"
+    base = "/api/ogc"
     return {"title": "C2132 珠江新城洪涝 OGC API", "description":
             "淹没范围/建筑要素 OGC API – Features 服务(对标§四8, 供 QGIS/ArcGIS 直接加载)",
             "links": [_ogc_link(base, "self"),
@@ -2464,7 +2624,7 @@ _OGC_COLLECTIONS = {
 
 @app.get("/api/ogc/collections", tags=["OGC"])
 def ogc_collections(request: Request):
-    base = str(request.base_url).rstrip("/") + "/api/ogc/collections"
+    base = "/api/ogc/collections"
     return {"collections": [
         {"id": cid, **meta,
          "links": [_ogc_link(base + "/" + cid, "self", title=meta["title"]),
@@ -2475,7 +2635,7 @@ def ogc_collections(request: Request):
 
 @app.get("/api/ogc/collections/{cid}", tags=["OGC"])
 def ogc_collection(cid: str, request: Request):
-    base = str(request.base_url).rstrip("/") + "/api/ogc/collections"
+    base = "/api/ogc/collections"
     if cid not in _OGC_COLLECTIONS:
         return JSONResponse({"error": "未知集合 %s" % cid}, status_code=404)
     return {"id": cid, **_OGC_COLLECTIONS[cid],
@@ -2541,7 +2701,7 @@ def design_storm(return_period: int = Query(50, ge=2, le=100),
     一致性保证: 任一历时窗口内的最大雨量严格等于官方公式值(交替块法构造性质),
     测试据此校验。源: 广州市水务局 2023-03-07 公告及所附技术报告。"""
     K = duration_min // step_min
-    if K < 2:
+    if duration_min % step_min or 60 % step_min or K < 2:
         return JSONResponse({"error": "历时须为步长的整数倍且≥2块"}, status_code=400)
     durs = [(k + 1) * step_min for k in range(K)]
     try:
@@ -2552,7 +2712,7 @@ def design_storm(return_period: int = Query(50, ge=2, le=100),
     # 交替块排列: 先生成槽位序列[峰位,+1,-1,+2,-2…](越界跳过), 块按降序依秩次放入;
     # 保证任一历时窗口的最大雨量=官方公式值(交替块法构造性质), 峰值块位于 peak_pos·T
     order = sorted(range(K), key=lambda k: -blocks[k])
-    peak = int(round(peak_pos * K))
+    peak = min(K - 1, int(round(peak_pos * K)))
     seq = [peak]
     step = 1
     while len(seq) < K:
@@ -2572,8 +2732,8 @@ def design_storm(return_period: int = Query(50, ge=2, le=100),
             "return_period": return_period, "duration_min": duration_min,
             "step_min": step_min, "peak_pos": peak_pos,
             "total_mm": round(total, 1),
-            "max_60min_mm": round(max((sum(hyeto[i:i + 12 // step_min])
-                                       for i in range(0, K - max(1, 12 // step_min) + 1)), default=0.0), 1),
+            "max_60min_mm": round(max((sum(hyeto[i:i + min(K, 60 // step_min)])
+                                       for i in range(K - min(K, 60 // step_min) + 1)), default=0.0), 1),
             "hyetograph_mm": hyeto,
             "labels_min": [(k + 1) * step_min for k in range(K)],
             "note": "交替块法排列(等效 Chicago 雨型): 任一历时最大窗口雨量=官方公式值; "
@@ -2600,8 +2760,9 @@ def _critical_facilities():
                     j = json.load(f)
                 if isinstance(j.get("features"), list):
                     d = j
-            except Exception as e:
+            except (OSError, ValueError, TypeError, RecursionError) as e:
                 _log.warning("critical_facilities.json 解析失败: %s", e)
+                d = {"features": [], "source": "数据文件损坏"}
         _FACILITIES_CACHE = d
     return _FACILITIES_CACHE
 
@@ -2628,6 +2789,12 @@ def cascade(d=Depends(_depth_or_404), return_period: int = Query(100, ge=2, le=1
     grid_nodes = [x for x in facs if x.get("kind") == "变电站"]
     have_grid = bool(grid_nodes)
     for f in facs:
+        if (not isinstance(f, dict) or not isinstance(f.get("lon"), (int, float))
+                or not isinstance(f.get("lat"), (int, float))
+                or not math.isfinite(f["lon"]) or not math.isfinite(f["lat"])
+                or not -180 <= f["lon"] <= 180 or not -90 <= f["lat"] <= 90):
+            _log.warning("跳过缺坐标或坐标非法的设施记录")
+            continue
         kind = f.get("kind", "")
         dv = _sample_grid(d_land, transform, f["lon"], f["lat"])
         depth = round(dv, 2) if dv is not None else None
@@ -2706,10 +2873,12 @@ class SafeStaticFiles(StaticFiles):
         parts = [p for p in norm.split("/") if p]
         if any(p.startswith(".") for p in parts):
             return "", None
+        if any(p.lower() == "reports" for p in parts):
+            return "", None  # 照片只经上面的鉴权路由，禁止副本/子目录绕过
         if parts and parts[-1].lower() in _SECRET_BASENAMES:
             return "", None
         ext = os.path.splitext(norm)[1].lower()
-        if ext and ext not in _ALLOWED_EXT:
+        if (not ext and norm != "LICENSE") or (ext and ext not in _ALLOWED_EXT):
             return "", None
         return super().lookup_path(path)
 

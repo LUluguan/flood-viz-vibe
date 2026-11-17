@@ -18,12 +18,16 @@ OUT = os.path.join(ROOT, "unet_out")
 
 
 def main(n=20):
+    if n <= 0:
+        raise ValueError("验证样本数 n 必须大于 0")
+    anns = sorted(glob.glob(os.path.join(DATA, "annotations", "*.tif")))
+    val = [a for a in anns if os.path.basename(a).startswith(("China", "South Africa", "Australia"))][-n:]
+    if not val:
+        raise ValueError("验证集为空，请检查 DATA 路径和样本地区；未计算 IoU")
+
     ck = torch.load(CKPT, map_location="cpu", weights_only=True)
     mean, std, size = ck["mean"], ck["std"], ck["size"]
     model = UNet(5, 1, base=ck["base"]); model.load_state_dict(ck["state_dict"]); model.eval()
-
-    anns = sorted(glob.glob(os.path.join(DATA, "annotations", "*.tif")))
-    val = [a for a in anns if a.split("\\")[-1].startswith(("China", "South Africa", "Australia"))][-n:]
 
     total_inter = 0; total_union = 0; n_water = 0
     for i, a in enumerate(val):
@@ -33,11 +37,12 @@ def main(n=20):
         A = tifffile.imread(a)
         gt = (A < 255).astype(np.uint8)
 
-        if I.shape[0] != size:
-            I = np.stack([np.array(Image.fromarray(I[..., b].astype("uint16"), "I;16").resize((size, size)))
-                          for b in range(5)], axis=2).astype(np.float32)
+        if I.shape[:2] != (size, size):
+            I = np.stack([np.array(Image.fromarray(I[..., b]).resize(
+                (size, size), Image.Resampling.BILINEAR)) for b in range(5)], axis=2)
+        if gt.shape != (size, size):
             # 标签二值: NEAREST, 避免插值晕边改变水面占比
-            gt = np.array(Image.fromarray((gt * 255).astype("uint8"), "L").resize((size, size), Image.NEAREST)) > 0
+            gt = np.array(Image.fromarray(gt).resize((size, size), Image.Resampling.NEAREST))
         X = I.transpose(2, 0, 1)
         for b in range(5):
             X[b] = (X[b] - mean[b]) / std[b]

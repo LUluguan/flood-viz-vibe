@@ -65,8 +65,8 @@ uvicorn app:app --host 127.0.0.1 --port 8001
 4. **GeoScene 2D 分析**(`analysis.html`):GeoScene API for JavaScript 消费 GeoScene Online 托管要素服务,重现期过滤与专题渲染
 5. **情景双屏对比**(`compare.html`):A/B 双屏任选重现期或自定义雨量,淹没地图 + 统计 + 预警自动对比,输出 Δ 差值表
 6. **移动公众报汛**(`mobile.html`):H5 查看分级预警与实时雨情,积水点随手报(自动定位+拍照);管理员可核实/处置/标记误报
-7. **用户登录**(`login.html`):admin/admin123(管理员,审核报汛)、public/123456(公众)
-8. **应急决策支持**:预警发布、避难场所、疏散路径、孤岛待援(三维场景内体验)
+7. **用户登录**(`login.html`):默认安全模式禁用演示弱口令；仅本机显式 `FLOOD_DEMO=1` 时展示 admin/admin123 与 public/123456 演示账号
+8. **应急决策支持**:只读预警、避难场所、疏散路径、孤岛待援；真实通知须由管理员显式发布，订阅先确认且按分区匹配
 9. **专题图工作台**(`thematic.html`):Copernicus EMS 模板三件套——淹没范围 / 受影响关键设施 / 危险分级,成套导出
 10. **工程化增强**:±20% 雨量不确定性带(紫色水体图层)、淹没水深预渲染 XYZ 瓦片图层、UNet 精度卡常驻、公众报讯分类与已核实上图、断网 IndexedDB 缓存兜底、补楼 LOD 距离分级、`ℹ 关于`数据来源与许可
 
@@ -96,8 +96,28 @@ realevent_out/          真实事件结果(真彩/掩膜/水深 PNG + depth.tif 
 dem/                    研究区 DEM(GLO-30)
 unet_out/               训练好的 UNet 模型 + 演示样本
 reports/                公众报汛数据(reports.json + 照片, 运行时生成)
-web_users.json          用户表(首次登录自动播种演示账号)
+web_users.json          本地用户表（不入库/交付包；FLOOD_DATA_DIR 可改为持久状态目录）
 ```
+
+## 安全运行与隐私
+
+- **管理员初始化**：未开演示且用户表不存在时，设置至少 12 字符的 `FLOOD_ADMIN_PASSWORD`。已有用户不会重置；安全模式下使用旧演示弱口令的账号必须重设密码，不会用环境变量覆盖用户表。
+- **本机演示**：PowerShell 可执行 `$env:FLOOD_DEMO='1'`，且只绑定 `127.0.0.1`。生产、容器和反向代理默认 `FLOOD_DEMO=0`。
+- **报汛**：公众列表只显示审核后的摘要和约百米粗坐标；待核实详情、描述、精确坐标与照片需管理员请求头令牌，管理员照片经鉴权接口返回。提交页面说明核实用途，不自动清除历史数据。
+- **订阅与通知**：订阅先处于待确认；邮件里的链接通过 `#fragment` 保存一次性令牌，用户点击页面按钮后才确认/退订。GET `/api/warning` 只计算，不发邮件或企业微信；真实发送使用管理员 `POST /api/warning/publish`，请求体 `{"return_period":100}`，只向已确认且匹配分区的地址发送。入队不等于送达。
+- **确认邮件配置**：需要 `PUBLIC_BASE_URL`（生产 HTTPS，开发允许 localhost）和 SMTP。`SMTP_SECURITY=ssl|starttls|none` 分别对应 465/587/25；`none` 不加密，仅隔离网络使用。未配置真实邮件渠道时只登记待确认状态，不冒充发送。
+- **地图客户端凭据**：浏览器直连天地图/Cesium 需要客户端 key，属于公开客户端凭据，不是服务端秘密；应在控制台限制 Referer/allowed URLs 与配额。构建镜像和交付包不包含真实 `web/config.local.js`、`.env` 或用户状态。服务商轮换仍需账号所有者执行。
+
+## 依赖与构建
+
+```bash
+python -m pip install -r requirements-cpu.txt
+python -m pip install -r requirements-dev.txt
+pytest -q
+python tools/sync_delivery.py --check
+```
+
+交付同步与打包导入无副作用；旧副本含凭据时拒绝覆盖，须人工复核或选择新目录。新包只能输出到不存在的新路径，旧 `C2132_作品.zip` 不会被脚本覆盖。正式交付前用 `python tools/package_delivery.py --help` 查看明确参数，并检查 ZIP 完整性、SHA-256 清单和禁止路径。旧包未替换时交付 ZIP 测试仍应失败，不能仅修改时间戳规避。
 
 ## 核心算法(Route A)
 

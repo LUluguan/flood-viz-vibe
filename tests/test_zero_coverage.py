@@ -70,11 +70,11 @@ def test_subscribe_get_and_post():
     # POST 正常登记
     r = c.post("/api/subscribe", json={"email": "cov@example.com", "zone": "区2"})
     assert r.status_code == 200 and r.json()["ok"] is True, r.text
-    total1 = r.json()["total"]
-    # 同邮箱重复登记不新增(总数不变)
+    assert "total" not in r.json(), "登记响应不得用于枚举订阅数"
     r = c.post("/api/subscribe", json={"email": "cov@example.com", "zone": "区2"})
-    assert r.json()["total"] == total1
-    # GET 无 token → 401; admin token → 200
+    assert r.json()["ok"] is True
+    import store
+    assert not store._load_subscribers()[0]["confirmed"]
     assert c.get("/api/subscribe").status_code == 401
     tok = c.post("/api/auth/login", json={"username": "admin", "password": "admin123"}).json()["token"]
     r = c.get("/api/subscribe", params={"token": tok})

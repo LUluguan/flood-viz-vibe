@@ -20,4 +20,16 @@ def _isolate_stores(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "_report_rl", {})   # 频控表逐用例隔离(登录/订阅/报讯互不串扰)
     # 测试密封性: 默认禁用真实 LLM/.env key(个别用例自行打桩回开), 防套件触外网
     monkeypatch.setattr(app, "LLM_CFG", {"api_key": "", "base_url": "", "model": ""})
+    monkeypatch.setenv("FLOOD_DEMO", "1")  # 演示兼容测试；安全模式用例自行关闭
+    monkeypatch.delenv("FLOOD_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr(app, "WECOM_WEBHOOK_URL", "")
+    monkeypatch.setattr(app, "SMTP_CFG", {"host": "", "port": 465, "user": "", "password": "", "use_tls": True})
+    monkeypatch.setattr(app, "_NOTIFY_STATE", str(d / "notify_state.json"))
+    monkeypatch.setattr(app, "fetch_openmeteo", lambda **kwargs: None)
+    monkeypatch.setattr(store, "_reports_degraded_from", None)
+    for name in ("_subscribers_degraded_from", "_users_degraded_from"):
+        monkeypatch.setattr(store, name, None, raising=False)
+    monkeypatch.setattr(store, "_state_quarantines", [0])
+    monkeypatch.setattr(store, "_rate_gc_next", 0.0, raising=False)
+    monkeypatch.setattr(app, "_db_health_cache", None, raising=False)
     yield

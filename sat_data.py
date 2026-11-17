@@ -13,6 +13,9 @@ SIGN = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
 
 def stac_search(collection, bbox, datetime, limit=5, sortby=None):
+    """返回单次检索页的 features；limit 是传给服务的页大小, 不自动遍历后续页。
+    当前管线只选本页影像；未具备真实 next-link fixture, 不推测续页协议。
+    """
     import requests
     payload = {"collections": [collection], "bbox": list(bbox),
                "datetime": datetime, "limit": limit}
@@ -24,21 +27,23 @@ def stac_search(collection, bbox, datetime, limit=5, sortby=None):
 
 
 def sign_url(href, retries=4):
-    """PC 匿名签名(限流/网关瞬断退避重试: 5/15/30/60s)。429 与 5xx 均为暂时性错误。"""
+    """PC 匿名签名；retries 为总尝试次数, 429/500/502/503/504 间退避 5/15/30/60s。
+    最后一次失败直接抛带 response 的 HTTPError(兼容调用方), 不再无谓等待。
+    """
     import requests
     import time
-    last = None
+    if type(retries) is not int or retries < 1:
+        raise ValueError("retries 必须为正整数(总尝试次数)")
     for i in range(retries):
         r = requests.get(SIGN, params={"href": href}, timeout=60)
         if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
-            wait = (5, 15, 30, 60)[min(i, 3)]
-            time.sleep(wait)
-            last = r
+            if i == retries - 1:
+                raise requests.HTTPError("签名接口重试耗尽(%d 次, 最后 HTTP %d)" %
+                                         (retries, r.status_code), response=r)
+            time.sleep((5, 15, 30, 60)[min(i, 3)])
             continue
         r.raise_for_status()
         return r.json()["href"]
-    last.raise_for_status()
-    raise RuntimeError("签名接口持续不可用(最后 HTTP %d)" % last.status_code)
 
 
 def lonlat_bbox_to_grid(bbox, dst_epsg, res_m):
@@ -67,7 +72,7 @@ def read_window(href, bbox, dst_epsg, out_width, out_height, resampling=None):
         d = src.read(1, window=win, boundless=True).astype("float32")
         if src.nodata is not None:
             d = np.where(d == src.nodata, -9999.0, d)
-        src_tf = src.transform * Affine.translation(win.col_off, win.row_off)
+        src_tf = src.transform @ Affine.translation(win.col_off, win.row_off)
         out = np.full((out_height, out_width), np.nan, dtype="float32")
         reproject(d, out, src_transform=src_tf, src_crs=src.crs,
                   src_nodata=-9999.0, dst_transform=dst_transform, dst_crs=dst_crs,

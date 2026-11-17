@@ -26,7 +26,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # pipeline/
 import sat_data
 import unet_apply
 import sar_change
-from pipeline_config import DEPTH_CAP, DEPTH_THRESH   # 色带上限/淹没阈值唯一权威(ARC-01)
+from flood_render import colorize_depth
 
 OUTBASE = os.path.join(ROOT, "realevent_out")
 EVENTS_JSON = os.path.join(ROOT, "realevent_events.json")
@@ -81,15 +81,11 @@ def cloud_frac(scl):
 
 
 def depth_rgba(depth):
-    d = np.nan_to_num(np.asarray(depth, dtype="float32"), nan=0.0)
-    m = np.isfinite(depth) & (depth > DEPTH_THRESH)
-    t = np.clip(d / DEPTH_CAP, 0, 1)
-    img = np.zeros(d.shape + (4,), dtype=np.uint8)
-    img[..., 0] = (166 * (1 - t)).astype("uint8")
-    img[..., 1] = (227 - 176 * t).astype("uint8")
-    img[..., 2] = (255 - 153 * t).astype("uint8")
-    img[..., 3] = np.where(m, 200, 0).astype("uint8")
-    return img
+    """共享 RGB 色带，保留事件图的有限值/阈值 alpha=200 契约。"""
+    depth = np.asarray(depth, dtype="float32")
+    finite = np.isfinite(depth)
+    # 先清理 NaN/inf，既避免共享色带 astype 告警，也避免 +inf 被着色。
+    return colorize_depth(np.where(finite, depth, 0.0), land=finite)
 
 
 def truecolor_rgb(b04, b03, b02, pct=98):

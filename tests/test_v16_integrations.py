@@ -65,18 +65,12 @@ def test_warning_notify_channel(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "WECOM_WEBHOOK_URL", "https://example.invalid/hook")
     monkeypatch.setattr(app, "_NOTIFY_STATE", str(tmp_path / "notify_state.json"))
     monkeypatch.setattr(app, "notify_async",
-                        lambda *a, **kw: sent.append(a) or _noop_thread())
+                        lambda *a, **kw: sent.append(a) or {"queued": True, "reason": ""})
     c = TestClient(app.app)
     r1 = c.get("/api/warning", params={"return_period": 100}).json()
     assert r1["notify"]["channel"] == "企业微信+邮件"
-    if r1["city_level"] in ("橙色", "红色"):
-        assert r1["notify"].get("sent"), "橙/红预警且已配置 webhook 应触发触达"
-        assert "洪涝预警" in sent[0][3]           # markdown 标题
-        # 冷却: 同情景同等级 30 分钟内不重复
-        c.get("/api/warning", params={"return_period": 100})
-        assert len(sent) == 1, "冷却期内不应重复触达"
-    else:
-        assert not sent
+    assert r1["notify"].get("sent") is False
+    assert not sent, "查询预警不能在 GET 请求中发出真实通知"
 
 
 def _noop_thread():

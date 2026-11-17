@@ -1,18 +1,31 @@
 FROM python:3.13-slim
 
 WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    FLOOD_DATA_DIR=/app/state \
+    FLOOD_DEMO=0 \
+    TZ=Asia/Shanghai
 
-# 中文字体(专题图 PNG 制图需要, slim 镜像默认无任何字体)
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-wqy-microhei \
-    && rm -rf /var/lib/apt/lists/*
+# Chinese map labels and timezone data; no host permission changes.
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-wqy-microhei tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 flood \
+    && useradd --uid 10001 --gid 10001 --no-create-home flood
 
-# 先装依赖(利用镜像层缓存)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Install CPU torch ONCE, before runtime, never the default Linux CUDA wheel.
+COPY requirements-cpu.txt requirements-runtime.txt ./
+RUN python -m pip install --no-cache-dir -r requirements-cpu.txt \
+    && python -m pip install --no-cache-dir -r requirements-runtime.txt \
+    && python -m pip check
 
-# 拷贝应用(大文件由 .dockerignore 排除)
+# .dockerignore excludes credentials, user state, archives and training sources.
+# Keep application code root-owned; only state is writable by the runtime user.
 COPY . .
-
+RUN mkdir -p /app/state && chown 10001:10001 /app/state
+VOLUME ["/app/state"]
+USER 10001:10001
 EXPOSE 8001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=3).close()"
 CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001"]

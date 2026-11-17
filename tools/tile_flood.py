@@ -24,7 +24,7 @@ from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from pipeline_config import STUDY_WS as BOUNDS     # 研究区唯一权威定义
-from pipeline_config import DEPTH_CAP, DEPTH_THRESH  # 色带上限/淹没阈值唯一权威(ARC-01)
+from pipeline_config import DEPTH_CAP, DEPTH_THRESH, RETURNS  # 权威阈值与重现期
 from flood_render import colorize_depth             # 色带唯一实现(ARC-01d: 本文件曾自持 12 行渐变)
 OUTBASE = os.path.join(ROOT, "flood_out", "flood_tiles")
 ZOOMS = range(9, 15)
@@ -87,9 +87,17 @@ def main():
             "tile_size": TILE, "depth_cap_m": DEPTH_CAP,
             "color": "flood_render.colorize_depth 唯一实现", "scheme": "XYZ/EPSG3857",
             "scenarios": {}}
-    for T in (2, 5, 10, 50, 100):
-        src_path = os.path.join(ROOT, "flood_out", "flood_depth_%dy.tif" % T)
-        if not os.path.exists(src_path):
+    sources = {T: os.path.join(ROOT, "flood_out", "flood_depth_%dy.tif" % T) for T in RETURNS}
+    available = {T: path for T, path in sources.items() if os.path.exists(path)}
+    # 无情景时仍可正常跳过；否则 DTM/浮点陆域掩膜在全部循环外只生成一次。
+    if available:
+        dtm_path = os.path.join(ROOT, "dem", "study_dtm.tif")
+        with rasterio.open(dtm_path) as dsrc:
+            z_dtm = dsrc.read(1).astype("float32")
+        land_f = (np.isfinite(z_dtm) & (z_dtm > 0)).astype("float32")
+    for T in RETURNS:
+        src_path = available.get(T)
+        if src_path is None:
             print("skip T=%dy (no tif)" % T)
             continue
         with rasterio.open(src_path) as src:
@@ -97,13 +105,6 @@ def main():
             src_transform = src.transform
         arr[~np.isfinite(arr)] = 0.0
         arr[arr < 0] = 0.0
-        # 陆域掩膜(与 app.py 口径一致): 河道常年水体不上色
-        dtm_path = os.path.join(ROOT, "dem", "study_dtm.tif")
-        with rasterio.open(dtm_path) as dsrc:
-            z_dtm = dsrc.read(1).astype("float32")
-        z_dtm[~np.isfinite(z_dtm)] = 0.0
-        land_src = z_dtm > 0
-
         outdir = os.path.join(OUTBASE, str(T))
         n_scen = 0
         for z in ZOOMS:
@@ -112,7 +113,7 @@ def main():
             for x in range(min(x0, x1), max(x0, x1) + 1):
                 for y in range(min(y0, y1), max(y0, y1) + 1):
                     depth = sample_tile(arr, src_transform, x, y, z)
-                    land = sample_tile(land_src.astype("float32"), src_transform, x, y, z) > 0.5
+                    land = sample_tile(land_f, src_transform, x, y, z) > 0.5
                     if float((depth * land).max()) <= DEPTH_THRESH:
                         continue                       # 干瓦片不落盘(前端 404 即透明)
                     img = colorize(depth, land=land)

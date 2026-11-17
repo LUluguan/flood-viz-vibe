@@ -131,7 +131,7 @@ def test_report_flow():
     c = _client()
     # 自清理: 记录上报表当前状态, 测试结束后恢复(旧版每跑一次追加 2 条测试夹具到交付数据)
     import json as _json
-    rp = os.path.join(ROOT, "reports", "reports.json")
+    rp = store._REPORTS_FILE  # conftest 的隔离存储，不读写真实报汛文件
     snap = _json.load(open(rp, encoding="utf-8")) if os.path.exists(rp) else None
     try:
         r = c.post("/api/report", json={"lon": 113.33, "lat": 23.11,
@@ -139,8 +139,10 @@ def test_report_flow():
                                         "depth_est": "0.3m", "desc": "测试上报, 可删除"})
         assert r.status_code == 200, r.text
         rid = r.json()["id"]
-        r = c.get("/api/report")
+        tok = _admin_token(c)
+        r = c.get("/api/report", headers={"Authorization": "Bearer " + tok})
         assert any(x["id"] == rid for x in r.json()["reports"])
+        assert c.get("/api/report").json()["reports"] == []  # 待核实详情不匿名公开
         # 无 token 不可改状态
         r = c.post("/api/report/%s/status" % rid, json={"status": "已核实"})
         assert r.status_code == 401
@@ -160,7 +162,7 @@ def test_report_flow():
         rid2 = r.json()["id"]
         assert r.json()["item"].get("image"), "照片未保存"
         assert os.path.exists(os.path.join(store._REPORT_DIR, r.json()["item"]["image"]))
-        r = c.get("/api/report")
+        r = c.get("/api/report", headers={"Authorization": "Bearer " + tok})
         item2 = next(x for x in r.json()["reports"] if x["id"] == rid2)
         assert item2.get("image_url", "").startswith("/reports/")
     finally:

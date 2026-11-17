@@ -1,0 +1,7 @@
+# FIRST: python -m pip install -r requirements-cpu.txt
+# THEN:  python -m pip install -r requirements.txt (or requirements-dev.txt)
+# Keep this separate: the PyTorch index must not resolve all runtime packages.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+# CPU wheel优先；jinja2/fsspec等传递依赖从PyPI正常解析，避免pip check缺依赖。
+torch>=2.2,<3.0

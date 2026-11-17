@@ -13,6 +13,7 @@
              同源/跨域影像都能得到与各自口径一致的推理结果。
 """
 import os
+import threading
 import numpy as np
 from PIL import Image
 import torch
@@ -23,18 +24,21 @@ CKPT = os.path.join(ROOT, "unet_out", "unet_water.pt")
 
 _model_cache = None      # (ckpt_dict, model)
 _ckpt_path_used = None
+_model_lock = threading.Lock()
 
 
 def load_model(ckpt_path=CKPT):
-    """加载并缓存模型(进程级单例), 避免 /api/predict 每次请求重读 checkpoint。"""
+    """加载并缓存模型(进程级单槽)，并发首击只加载一次；失败不污染缓存。"""
     global _model_cache, _ckpt_path_used
-    if _model_cache is None or _ckpt_path_used != ckpt_path:
-        ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        model = UNet(5, 1, base=ck["base"])
-        model.load_state_dict(ck["state_dict"])
-        model.eval()
-        _model_cache, _ckpt_path_used = (ck, model), ckpt_path
-    return _model_cache
+    with _model_lock:
+        if _model_cache is None or _ckpt_path_used != ckpt_path:
+            ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            model = UNet(5, 1, base=ck["base"])
+            model.load_state_dict(ck["state_dict"])
+            model.eval()
+            _model_cache, _ckpt_path_used = (ck, model), ckpt_path
+        # 持锁取回同一快照，避免其它路径请求刚好替换单槽缓存。
+        return _model_cache
 
 
 def normalize(stack):
@@ -94,7 +98,7 @@ def predict_mask(stack, size=128, thr=0.5, norm="auto", ckpt_path=CKPT):
 
 def invert_depth(mask, dem):
     """mask (H,W) bool/uint8, dem (H,W) float -> (W_level, depth)。复用 water_level_inversion.invert。"""
-    from water_level_inversion import invert
+    from pipeline.water_level_inversion import invert
     m = mask.astype(bool)
     if m.shape != dem.shape:
         m = np.array(Image.fromarray((m * 255).astype("uint8"), "L")

@@ -8,6 +8,7 @@ import argparse, os
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # pipeline/ 子目录 -> 仓库根
 import numpy as np
 import tifffile
+from PIL import Image
 import torch
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # pipeline/ 子目录: 仓库根入 path(共享模块 pipeline_config/proj_fix/...)
@@ -21,16 +22,24 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "unet_out", "infer_mask.png"))
     ap.add_argument("--size", type=int, default=256)
     args = ap.parse_args()
+    if args.size <= 0 or args.size % 16:
+        raise ValueError("size 必须是正的 16 倍数(UNet 含四级下采样)")
 
-    ck = torch.load(args.ckpt, map_location="cpu")
-    mean, std = ck["mean"], ck["std"]
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+    mean = np.asarray(ck["mean"], dtype=np.float32)
+    std = np.asarray(ck["std"], dtype=np.float32)
+    if mean.shape != (5,) or not np.isfinite(mean).all():
+        raise ValueError("checkpoint mean 必须是 5 个有限数值")
+    if std.shape != (5,) or not np.isfinite(std).all() or (std <= 0).any():
+        raise ValueError("checkpoint std 必须是 5 个有限正数")
 
     I = tifffile.imread(args.img).astype(np.float32)   # (H, W, 5)
+    if I.ndim != 3 or I.shape[2] != 5:
+        raise ValueError("输入影像必须为 (H, W, 5) 的 5 波段数据")
     h, w = I.shape[:2]
     if h != args.size or w != args.size:
-        from PIL import Image
-        I = np.stack([np.array(Image.fromarray(I[..., b].astype("uint16"), "I;16").resize((args.size, args.size)))
-                      for b in range(5)], axis=2).astype(np.float32)
+        I = np.stack([np.array(Image.fromarray(I[..., b]).resize(
+            (args.size, args.size), Image.Resampling.BILINEAR)) for b in range(5)], axis=2)
     X = I.transpose(2, 0, 1)                          # (5, H, W)
     for b in range(5):
         X[b] = (X[b] - mean[b]) / std[b]
@@ -41,7 +50,9 @@ def main():
         prob = torch.sigmoid(model(Xt))[0, 0].numpy()  # (H, W)
     mask = (prob > 0.5).astype(np.uint8) * 255
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    outdir = os.path.dirname(args.out)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     Image.fromarray(mask, "L").save(args.out)
     print("water fraction = %.3f%%  -> %s" % (100.0 * mask.mean() / 255.0, args.out))
 

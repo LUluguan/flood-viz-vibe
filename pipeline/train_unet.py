@@ -16,6 +16,7 @@ train_unet.py — 在 GF-FloodNet 上训练 UNet 水体提取模型(CPU 版, 子
 import os, glob, json, random, argparse, time, collections
 import numpy as np
 import tifffile
+from PIL import Image
 import torch
 import torch.nn as nn
 import sys
@@ -82,11 +83,12 @@ def preload(pairs, size):
     for img, ann in pairs:
         I = tifffile.imread(img)                       # (H, W, 5) uint16
         A = tifffile.imread(ann)                       # (H, W) uint8
-        if size != I.shape[0]:
-            from PIL import Image
-            I = np.stack([np.array(Image.fromarray(I[..., b], 'I;16').resize((size, size)))
-                          for b in range(I.shape[2])], axis=2)
-            A = np.array(Image.fromarray(A, 'L').resize((size, size)))
+        if I.shape[:2] != (size, size):
+            # 连续影像用浮点双线性；分类标签独立按最近邻缩放，禁止晕边膨胀。
+            I = np.stack([np.array(Image.fromarray(I[..., b].astype(np.float32)).resize(
+                (size, size), Image.Resampling.BILINEAR)) for b in range(I.shape[2])], axis=2)
+        if A.shape != (size, size):
+            A = np.array(Image.fromarray(A).resize((size, size), Image.Resampling.NEAREST))
         imgs.append(I.transpose(2, 0, 1))              # (5, H, W)
         masks.append((A < 255).astype(np.float32))     # 水体=1
     imgs = np.stack(imgs).astype(np.float32)

@@ -59,11 +59,12 @@ def main(n=6):
             continue
         name = os.path.basename(a).replace(".tif", "")
         I = tifffile.imread(img).astype(np.float32)
-        if I.shape[0] != size:
-            I = np.stack([np.array(Image.fromarray(I[..., b].astype("uint16"), "I;16").resize((size, size)))
-                          for b in range(5)], axis=2).astype(np.float32)
+        if I.shape[:2] != (size, size):
+            I = np.stack([np.array(Image.fromarray(I[..., b]).resize(
+                (size, size), Image.Resampling.BILINEAR)) for b in range(5)], axis=2)
+        if A.shape != (size, size):
             # 标签是二值分类: 必须 NEAREST, 默认重采样会产生 <255 晕边改变水面占比
-            A = np.array(Image.fromarray(A, "L").resize((size, size), Image.NEAREST))
+            A = np.array(Image.fromarray(A).resize((size, size), Image.Resampling.NEAREST))
         gt = (A < 255).astype(np.uint8)
         X = I.transpose(2, 0, 1)
         for b in range(5):
@@ -72,6 +73,9 @@ def main(n=6):
             prob = torch.sigmoid(model(torch.from_numpy(X[None])))[0, 0].numpy()
         pred = (prob > 0.5).astype(np.uint8)
 
+        # 精度计算读取原始二值数组，不从 RGB 覆盖图反解(蓝/绿地物会误判)。
+        np.save(os.path.join(OUT, name + "_pred_mask.npy"), pred, allow_pickle=False)
+        np.save(os.path.join(OUT, name + "_gt_mask.npy"), gt, allow_pickle=False)
         rgb = to_rgb(I)
         p = rgb.copy(); p[pred > 0] = [0, 140, 255]
         g = rgb.copy(); g[gt > 0] = [0, 255, 140]

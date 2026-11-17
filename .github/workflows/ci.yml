@@ -1,40 +1,157 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_network:
+        description: "Opt in to public STAC/COG network tests (no notification secrets)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUTF8: "1"
+  FLOOD_DEMO: "0"
+  FLOOD_DB_PASSWORD: ""
+  LLM_API_KEY: ""
+  WECOM_WEBHOOK_URL: ""
+  SMTP_HOST: ""
+  SMTP_PASSWORD: ""
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install deps (CPU torch)
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install CPU torch before runtime and dev dependencies
         run: |
-          pip install -r requirements.txt
-          pip install httpx pytest ruff
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-      # 交付守护测试此前在 CI 恒走 SKIP 分支(副本被 gitignore, checkout 不恢复),
-      # 等于只在本机生效(QA-01); CI 内先重建副本, 守护测试即可真实运行
-      - name: Rebuild delivery copy
-        run: python tools/sync_delivery.py
-      - name: Ruff (real errors only: syntax + pyflakes)
-        run: ruff check --select E9,F63,F7,F82,F81,F401,F811,F841 app.py store.py pipeline_config.py flood_render.py flood_core.py externals.py tools/ tests/
-      - name: Run offline tests
+          python -m pip install -r requirements-cpu.txt
+          python -m pip install -r requirements-dev.txt
+      - name: Check dependency consistency
+        run: python -m pip check > pip-check.txt
+      - name: Ruff (syntax and pyflakes)
+        run: python -m ruff check --select E9,F63,F7,F82,F81,F401,F811,F841 app.py store.py pipeline_config.py flood_render.py flood_core.py externals.py tools/ tests/
+      # Delivery builders run only through tmp_path fixtures, never rewrite the old package/copy.
+      - name: Offline tests and first-party coverage gate
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: pytest -q --junitxml=pytest-report.xml
-      - name: Upload test report
+          FLOOD_DATA_DIR: ${{ runner.temp }}/flood-state
+        run: >-
+          python -m pytest -q -m "not network" --junitxml=pytest-report.xml
+          --cov=app --cov=store --cov=externals --cov=flood_core --cov=flood_render
+          --cov=pipeline_config --cov=unet_model --cov=unet_apply --cov=sar_change --cov=sat_data
+          --cov=tools.sync_delivery --cov=tools.package_delivery
+          --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html
+          --cov-fail-under=80
+      - name: Bandit (medium and high findings block)
+        if: ${{ !cancelled() }}
+        run: >-
+          python -m bandit -r app.py store.py externals.py flood_core.py flood_render.py
+          pipeline_config.py unet_model.py unet_apply.py sar_change.py sat_data.py
+          tools/sync_delivery.py tools/package_delivery.py
+          --severity-level medium -f json -o bandit-report.json
+      - name: Audit installed project environment
+        if: ${{ !cancelled() }}
+        run: python -m pip_audit --local --format json --output pip-audit.json
+      - name: Record resolved dependencies (artifact, not a fabricated source lock)
+        if: always()
+        run: python -m pip freeze > installed-requirements.txt
+      - name: Upload test and audit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-report
-          path: pytest-report.xml
-      - name: Freeze installed versions (reproducibility)
+          name: checks-${{ matrix.os }}
+          path: |
+            pytest-report.xml
+            coverage.xml
+            htmlcov/
+            bandit-report.json
+            pip-audit.json
+            pip-check.txt
+            installed-requirements.txt
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build local image only
+        run: docker build -t floodviz:ci .
+      - name: Check non-root image and credential exclusion
+        run: |
+          test "$(docker run --rm --entrypoint id floodviz:ci -u)" = "10001"
+          docker run --rm --entrypoint python floodviz:ci -c "from pathlib import Path; p=Path('/app'); assert not any(p.rglob('config.local.js')); assert not any(p.rglob('.env')); assert not any(p.rglob('web_users.json'))"
+      - name: Start with isolated test password and persistent state
+        # 只用于本次被销毁的CI容器，非可复用凭据；生产无用户表时同样必须显式设置。
+        run: docker run -d --name floodviz-ci -p 127.0.0.1:18001:8001 -e FLOOD_ADMIN_PASSWORD=ci-only-disposable-admin-2026 -e FLOOD_DEMO=0 -v floodviz-ci-state:/app/state floodviz:ci
+      - name: Wait for health and verify writable persistent state
+        run: |
+          python - <<'PY'
+          import subprocess, time
+          deadline = time.monotonic() + 90
+          while time.monotonic() < deadline:
+              status = subprocess.check_output(["docker", "inspect", "--format", "{{.State.Health.Status}}", "floodviz-ci"], text=True).strip()
+              if status == "healthy":
+                  break
+              time.sleep(2)
+          else:
+              raise SystemExit("Container did not become healthy")
+          PY
+          docker exec floodviz-ci python -c "from pathlib import Path; Path('/app/state/smoke.txt').write_text('persistent')"
+          docker stop floodviz-ci
+          docker run --rm -v floodviz-ci-state:/app/state --entrypoint python floodviz:ci -c "from pathlib import Path; assert Path('/app/state/smoke.txt').read_text() == 'persistent'"
+      - name: Capture container logs
         if: always()
-        run: pip freeze > requirements.lock
-      - name: Upload version lock
+        run: docker logs floodviz-ci > docker-smoke.log 2>&1
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: requirements-lock
-          path: requirements.lock
+          name: docker-smoke
+          path: docker-smoke.log
+      - name: Remove CI-only container and volume
+        if: always()
+        run: |
+          docker rm -f floodviz-ci || true
+          docker volume rm floodviz-ci-state || true
+
+  network-manual:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_network }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install CPU and dev dependencies
+        run: |
+          python -m pip install -r requirements-cpu.txt
+          python -m pip install -r requirements-dev.txt
+          python -m pip check
+      - name: Public STAC and COG only (no mail or paid API tests)
+        env:
+          FLOOD_DATA_DIR: ${{ runner.temp }}/flood-network-state
+        run: python -m pytest tests/test_sat_data.py -q -m network --junitxml=network-report.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: network-manual
+          path: network-report.xml

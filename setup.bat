@@ -1,21 +1,34 @@
 @echo off
-REM ============================================
-REM  洪涝可视化（vibe）· 三维城市降雨洪涝 - 一键安装依赖
-REM  首次使用: 双击本文件; 之后直接运行 run.bat
-REM ============================================
+setlocal
+REM setup.bat [--dev]: CPU bootstrap first, then local runtime/pipeline or tests.
 chcp 65001 >nul
 cd /d "%~dp0"
-echo [1/4] 检查 Python ...
-where python >nul 2>nul || (echo [错误] 未找到 python, 请先安装 Python 3.10+ 并加入 PATH & pause & exit /b 1)
-python -c "import sys; assert sys.version_info >= (3,10), '需 Python 3.10+'; print('    Python', sys.version.split()[0])" || (pause & exit /b 1)
-echo [2/4] 创建虚拟环境 .venv ...
-if not exist .venv ( python -m venv .venv )
-call .venv\Scripts\activate.bat
-echo [3/4] 安装 Web/地理依赖 ...
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-echo [4/4] 安装 torch CPU 版 ...
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-echo.
-echo 安装完成! 请运行 run.bat 启动服务。
-pause
+if not "%~1"=="" if /i not "%~1"=="--dev" (
+  echo Usage: setup.bat [--dev]
+  exit /b 2
+)
+echo [1/5] Checking Python ...
+where python >nul 2>nul || goto :fail
+python -c "import sys; assert sys.version_info >= (3,11), 'Python 3.11+ required'; print(sys.version)" || goto :fail
+echo [2/5] Preparing .venv ...
+if not exist ".venv\Scripts\python.exe" python -m venv .venv
+if errorlevel 1 goto :fail
+set "PYTHON=%~dp0.venv\Scripts\python.exe"
+"%PYTHON%" -m pip install --upgrade pip || goto :fail
+echo [3/5] Installing CPU torch once ...
+"%PYTHON%" -m pip install -r requirements-cpu.txt || goto :fail
+echo [4/5] Installing runtime and offline tools ...
+if /i "%~1"=="--dev" goto :dev
+"%PYTHON%" -m pip install -r requirements.txt || goto :fail
+goto :check
+:dev
+"%PYTHON%" -m pip install -r requirements-dev.txt || goto :fail
+:check
+echo [5/5] Checking dependencies ...
+"%PYTHON%" -m pip check || goto :fail
+echo Ready. Set FLOOD_ADMIN_PASSWORD before first login, or FLOOD_DEMO=1 for local demo only.
+echo Run run.bat to start.
+exit /b 0
+:fail
+echo Setup failed. Fix the error above before starting the service.
+exit /b 1

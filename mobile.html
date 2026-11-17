@@ -107,7 +107,7 @@
       </div>
       <button id="submit">提交报汛</button>
       <div id="msg"></div>
-      <div class="note">提交的报汛将进入值班审核列表, 由管理员核实后纳入态势。请勿在深水区停留拍摄, 人身安全第一。</div>
+      <div class="note">提交的坐标、位置描述、情况描述和照片供管理员核实；仅已核实/已处理的摘要公开，公开坐标保留 3 位小数，不公开描述与照片。请勿提交无关个人信息或在深水区停留拍摄，人身安全第一。</div>
     </div>
 
     <div class="card">
@@ -116,7 +116,7 @@
     </div>
 
     <div class="card">
-      <h2>🔔 订阅预警 <span style="float:right;font-size:11px;color:#90a4ae">橙色/红色预警触发时通知</span></h2>
+      <h2>订阅预警 <span style="float:right;font-size:11px;color:#90a4ae">须先确认邮箱</span></h2>
       <div class="fld">
         <label>邮箱</label>
         <input id="subEmail" type="email" placeholder="you@example.com" />
@@ -131,7 +131,8 @@
         </select>
       </div>
       <button id="subBtn">订阅预警</button>
-      <div id="subMsg"></div>
+      <div id="subMsg" role="status" aria-live="polite"></div>
+      <div class="note">登记不代表立即通知；请按邮件链接确认订阅。仅在邮件服务可用且管理员发布匹配分区的预警时发送通知，可通过邮件中的退订链接取消。</div>
     </div>
   </div>
   <script src="web/common.js"></script>
@@ -140,6 +141,12 @@
     var curLon = null, curLat = null, imgData = null;
 
     function el(id) { return document.getElementById(id); }
+    function readJSONResponse(r) {
+      return r.json().then(function(d) {
+        if (!r.ok || !d || d.error) throw new Error((d && d.error) || ('HTTP ' + r.status));
+        return d;
+      });
+    }
 
     // ---- 预警卡 ----
     FLOOD.getJSON('/api/warning?return_period=100').then(function(w) {
@@ -148,17 +155,17 @@
       el('warnLv').textContent = w.city_level === '无' ? '无预警' : w.city_level;
       var hot = (w.zones || []).filter(function(z) { return z.level !== '无'; })
         .sort(function(a, b) { return b.ratio_pct - a.ratio_pct; })[0];
-      el('warnTx').innerHTML = '按 100 年一遇情景自动分级 · 淹没 ' + w.flooded_area_km2 + ' km²<br/>' +
-        w.advice + (hot ? '<br/>最高风险: 区' + hot.zone + '(' + hot.level + ', 陆地淹没 ' + Math.round(hot.ratio_pct) + '%)' : '') +
-        '<br/><span style="opacity:0.75;font-size:10px">发布时间 ' + w.published_at + ' · 阈值: ' + w.thresholds + '</span>';
+      el('warnTx').innerHTML = '按 100 年一遇情景自动分级 · 淹没 ' + FLOOD.esc(w.flooded_area_km2) + ' km²<br/>' +
+        FLOOD.esc(w.advice) + (hot ? '<br/>最高风险: 区' + FLOOD.esc(hot.zone) + '(' + FLOOD.esc(hot.level) + ', 陆地淹没 ' + Math.round(hot.ratio_pct) + '%)' : '') +
+        '<br/><span style="opacity:0.75;font-size:10px">计算时间 ' + FLOOD.esc(w.published_at) + ' · 阈值: ' + FLOOD.esc(w.thresholds) + ' · 查看不会发送通知</span>';
     }).catch(function() { el('warnTx').textContent = '预警服务不可用'; });
 
     // ---- 雨情卡 ----
     FLOOD.getJSON('/api/realtime_rain').then(function(d) {
       el('rainCard').innerHTML =
-        '<div class="row"><span>当前小时雨量</span><b>' + d.city_hour_rain_mm + ' mm (' + d.intensity_level + ')</b></div>' +
-        '<div class="row"><span>过去 24h 累计</span><b>' + d.city_rain24h_mm + ' mm</b></div>' +
-        '<div class="row"><span>出行提示</span><b>' + d.advice + '</b></div>';
+        '<div class="row"><span>当前小时雨量</span><b>' + FLOOD.esc(d.city_hour_rain_mm) + ' mm (' + FLOOD.esc(d.intensity_level) + ')</b></div>' +
+        '<div class="row"><span>过去 24h 累计</span><b>' + FLOOD.esc(d.city_rain24h_mm) + ' mm</b></div>' +
+        '<div class="row"><span>出行提示</span><b>' + FLOOD.esc(d.advice) + '</b></div>';
     }).catch(function() { el('rainCard').textContent = '实时雨情服务不可用'; });
 
     // ---- 定位 ----
@@ -167,6 +174,12 @@
       el('geoBtn').textContent = '定位中...';
       navigator.geolocation.getCurrentPosition(function(pos) {
         curLon = pos.coords.longitude; curLat = pos.coords.latitude;
+        if (!Number.isFinite(curLon) || !Number.isFinite(curLat)) {
+          curLon = null; curLat = null;
+          el('msg').className = 'bad'; el('msg').textContent = '定位坐标无效，请手动描述位置';
+          el('geoBtn').textContent = '重新定位';
+          return;
+        }
         var inBox = curLon >= B.west && curLon <= B.east && curLat >= B.south && curLat <= B.north;
         el('msg').className = 'ok';
         el('msg').textContent = '定位成功: ' + curLon.toFixed(5) + ', ' + curLat.toFixed(5) + (inBox ? '(研究区内)' : '(研究区外, 仅记录)');
@@ -222,28 +235,65 @@
       try { var u = JSON.parse(localStorage.getItem('flood_user') || 'null');
         return !!(u && u.role === 'admin' && localStorage.getItem('flood_token')); } catch (e) { return false; }
     }
+    var reportVersion = 0;
+    var reportObjectURLs = new Set();
+    function revokeReportURL(url) {
+      if (reportObjectURLs.delete(url)) URL.revokeObjectURL(url);
+    }
+    function clearReportImages() {
+      reportObjectURLs.forEach(function(url) { URL.revokeObjectURL(url); });
+      reportObjectURLs.clear();
+    }
+    function loadReportImage(row, path, token, version) {
+      if (!token || !/^\/reports\/img_[A-Za-z0-9_-]+\.(jpg|png|jpeg)$/.test(path)) return;
+      fetch(path, { headers: { 'x-auth-token': token }, cache: 'no-store', redirect: 'error' })
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.blob();
+        }).then(function(blob) {
+          if (version !== reportVersion || !el('rpList').contains(row)) return;
+          var img = document.createElement('img');
+          var url = URL.createObjectURL(blob);
+          reportObjectURLs.add(url);
+          img.alt = '现场照片（仅管理员可见）';
+          img.onload = function() { revokeReportURL(url); };
+          img.onerror = function() {
+            revokeReportURL(url);
+            if (version === reportVersion && el('rpList').contains(img)) img.alt = '照片无法显示';
+          };
+          img.src = url;
+          row.appendChild(img);
+        }).catch(function() {
+          if (version !== reportVersion || !el('rpList').contains(row)) return;
+          var note = document.createElement('div');
+          note.className = 'd'; note.textContent = '照片加载失败，请重新登录或稍后重试';
+          row.appendChild(note);
+        });
+    }
     function loadReports() {
-      FLOOD.getJSON('/api/report').then(function(d) {
-        var adm = isAdmin();
-        el('whoAmI').textContent = adm ? '管理员模式' : '';
-        if (!d.reports.length) { el('rpList').innerHTML = '<div class="rp" style="color:#90a4ae">暂无报汛记录</div>'; return; }
-        el('rpList').innerHTML = '';
-        // esc(): 用户上报文本(任何人可匿名写入)必须转义后才能进 innerHTML — 存储型 XSS 加固
-        function esc(s) {
-          return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
-            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-          });
-        }
-        d.reports.forEach(function(x) {
+      var version = ++reportVersion;
+      var token = localStorage.getItem('flood_token') || '';
+      var adm = isAdmin();
+      clearReportImages();
+      el('rpList').textContent = '加载中...';
+      el('whoAmI').textContent = adm ? '管理员模式（权限以服务端为准）' : '仅公开审核摘要';
+      // common.js 的第二参数仅支持超时毫秒，鉴权请求使用 fetch 并检查 HTTP 状态。
+      fetch('/api/report', { headers: { 'x-auth-token': token }, cache: 'no-store' })
+        .then(readJSONResponse).then(function(d) {
+        if (version !== reportVersion) return;
+        if (!Array.isArray(d.reports)) throw new Error('报汛响应格式错误');
+        var reports = adm ? d.reports : d.reports.filter(function(x) { return x.status === '已核实' || x.status === '已处理'; });
+        if (!reports.length) { el('rpList').textContent = '暂无可查看的报汛记录'; return; }
+        el('rpList').textContent = '';
+        reports.forEach(function(x) {
           var div = document.createElement('div');
           div.className = 'rp';
-          var loc = esc(x.location_text || (x.lon != null ? x.lon.toFixed(5) + ', ' + x.lat.toFixed(5) : '未标注位置'));
-          var img = (x.image_url && /^\/reports\/[\w.-]+$/.test(x.image_url)) ?
-            '<img src="' + esc(x.image_url) + '" alt="现场照片" />' : '';
+          var coords = Number.isFinite(x.lon) && Number.isFinite(x.lat) ?
+            x.lon.toFixed(adm ? 5 : 3) + ', ' + x.lat.toFixed(adm ? 5 : 3) : '未标注位置';
+          var loc = FLOOD.esc((adm && x.location_text) || coords);
           div.innerHTML = '<div class="t"><span>' + loc + '</span>' +
-            '<span class="badge ' + (STAT_CLS[esc(x.status)] || 'b3') + '">' + esc(x.status) + '</span></div>' +
-            '<div class="d">[' + esc(x.category || '积水') + '] ' + esc(x.depth_est || '') + (x.desc ? ' · ' + esc(x.desc) : '') + '<br/><span style="font-size:10px">' + esc(x.created_at) + '</span></div>' +
-            img;
+            '<span class="badge ' + (STAT_CLS[x.status] || 'b3') + '">' + FLOOD.esc(x.status) + '</span></div>' +
+            '<div class="d">[' + FLOOD.esc(x.category || '积水') + '] ' + FLOOD.esc(x.depth_est || '') + (adm && x.desc ? ' · ' + FLOOD.esc(x.desc) : '') + '<br/><span style="font-size:10px">' + FLOOD.esc(x.created_at) + '</span></div>';
           if (adm) {
             var bar = document.createElement('div');
             bar.className = 'adm'; bar.style.display = 'flex';
@@ -251,43 +301,48 @@
               var b = document.createElement('button');
               b.textContent = st;
               b.onclick = function() {
-                // token 走请求头(2026-10 审计 FE-02: query 里的 token 会进访问日志) + 失败反馈
+                if (b.disabled) return;
                 b.disabled = true;
-                fetch('/api/report/' + x.id + '/status',
+                fetch('/api/report/' + encodeURIComponent(x.id) + '/status',
                   { method: 'POST',
                     headers: { 'Content-Type': 'application/json',
                                'x-auth-token': localStorage.getItem('flood_token') || '' },
-                    body: JSON.stringify({ status: st }) }).then(function(r) { return r.json(); })
+                    body: JSON.stringify({ status: st }) }).then(readJSONResponse)
                   .then(function(d) {
-                    b.disabled = false;
-                    if (d && d.error) { alert('更新失败: ' + d.error); return; }
+                    if (d.ok !== true) throw new Error('未能确认更新结果');
                     loadReports();
-                  }).catch(function() { b.disabled = false; alert('更新失败: 网络错误'); });
+                  }).catch(function(e) { b.disabled = false; alert('更新失败: ' + e.message); });
               };
               bar.appendChild(b);
             });
             div.appendChild(bar);
           }
           el('rpList').appendChild(div);
+          if (adm && x.image_url) loadReportImage(div, x.image_url, token, version);
         });
-      }).catch(function() { el('rpList').innerHTML = '<div class="rp">报汛服务不可用</div>'; });
+      }).catch(function() {
+        if (version === reportVersion) el('rpList').textContent = '报汛服务不可用';
+      });
     }
+    window.addEventListener('pagehide', function() { reportVersion++; clearReportImages(); });
     loadReports();
 
-    // ---- 订阅预警(POST /api/subscribe; 橙/红预警在 /api/warning 返回触达统计) ----
+    // ---- 订阅登记：展示服务端 note，邮件确认与管理员发布独立执行。 ----
     el('subBtn').onclick = function() {
+      var btn = el('subBtn');
+      if (btn.disabled) return;
       var email = el('subEmail').value.trim();
-      if (!email || email.indexOf('@') < 0) { el('subMsg').textContent = '⚠ 请输入有效邮箱'; return; }
-      var btn = el('subBtn'); btn.disabled = true;
+      if (!email || email.indexOf('@') < 0) { el('subMsg').textContent = '请输入有效邮箱'; return; }
+      btn.disabled = true;
+      el('subMsg').textContent = '正在登记...';
       fetch('/api/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: email, zone: el('subZone').value }) })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          btn.disabled = false;
-          if (d.error) { el('subMsg').textContent = '⚠ ' + d.error; return; }
-          el('subMsg').textContent = '✓ 已登记(当前订阅 ' + d.total + ' 人); 橙/红预警将优先通知该分区';
+        .then(readJSONResponse).then(function(d) {
+          if (d.ok !== true || typeof d.note !== 'string') throw new Error('订阅响应格式错误');
+          el('subMsg').textContent = d.note;
           el('subEmail').value = '';
-        }).catch(function() { btn.disabled = false; el('subMsg').textContent = '⚠ 订阅失败'; });
+          btn.disabled = false;
+        }).catch(function(e) { btn.disabled = false; el('subMsg').textContent = '订阅失败: ' + e.message; });
     };
   </script>
 </body>

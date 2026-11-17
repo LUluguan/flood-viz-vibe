@@ -1,17 +1,25 @@
 services:
   floodviz:
     build: .
-    container_name: floodviz
     ports:
-      - "8001:8001"
+      - "127.0.0.1:${FLOOD_PORT:-8001}:8001"
     environment:
-      # PostGIS 可选; 不配置时服务层自动回退读本地 flood_out/ 文件
-      - FLOOD_DB_HOST=host.docker.internal
-      - FLOOD_DB_PORT=5432
-      - FLOOD_DB_NAME=flood_analysis
-      - FLOOD_DB_USER=postgres
-      - FLOOD_DB_PASSWORD=123456
-      # GeoScene Online 服务(竞赛要求: 不脱离 GeoScene 服务器端)。发布后填入, 为空则前端回退本地数据。
-      - GEOSCENE_EXTENT_URL=
-      - GEOSCENE_DEPTH_URL=
+      # Empty DB configuration permits local-file fallback, no default password.
+      FLOOD_DB_HOST: "${FLOOD_DB_HOST:-}"
+      FLOOD_DB_PORT: "${FLOOD_DB_PORT:-5432}"
+      FLOOD_DB_NAME: "${FLOOD_DB_NAME:-}"
+      FLOOD_DB_USER: "${FLOOD_DB_USER:-}"
+      FLOOD_DB_PASSWORD: "${FLOOD_DB_PASSWORD:-}"
+      FLOOD_DB_FIRST: "${FLOOD_DB_FIRST:-0}"
+      # Runtime injection only; no credential is baked into Docker layers.
+      FLOOD_ADMIN_PASSWORD: "${FLOOD_ADMIN_PASSWORD:-}"
+      FLOOD_DEMO: "${FLOOD_DEMO:-0}"
+      FLOOD_DATA_DIR: /app/state
+      GEOSCENE_EXTENT_URL: "${GEOSCENE_EXTENT_URL:-}"
+      GEOSCENE_DEPTH_URL: "${GEOSCENE_DEPTH_URL:-}"
+    volumes:
+      - flood-state:/app/state
     restart: unless-stopped
+
+volumes:
+  flood-state:

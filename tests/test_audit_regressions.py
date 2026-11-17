@@ -149,18 +149,21 @@ def test_tile_flood_band_shared():
     print("tile_flood 色带已共享 flood_render OK")
 
 
-def test_prep_design_storm_runs():
+def test_prep_design_storm_runs(tmp_path):
     """MISS-08/BUG-01: README 标注"必跑"的脚本必须能跑通(曾 NameError), 100 年≈300mm。
     (2026-10 工程化整理后位于 pipeline/ 子目录)"""
     import json as _json
     import subprocess
-    r = subprocess.run([sys.executable, os.path.join("pipeline", "prep_design_storm.py")],
-                       capture_output=True,
-                       cwd=ROOT,
-                       env=dict(os.environ, PYTHONPATH=ROOT, PYTHONIOENCODING="utf-8"))
+    import shutil
+    (tmp_path / "pipeline").mkdir()
+    (tmp_path / "flood_out").mkdir()
+    shutil.copy2(os.path.join(ROOT, "pipeline", "prep_design_storm.py"), tmp_path / "pipeline")
+    shutil.copy2(os.path.join(ROOT, "pipeline_config.py"), tmp_path)
+    r = subprocess.run([sys.executable, str(tmp_path / "pipeline" / "prep_design_storm.py")],
+                       capture_output=True, cwd=tmp_path,
+                       env=dict(os.environ, PYTHONPATH=str(tmp_path), PYTHONIOENCODING="utf-8"))
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-300:]
-    d = _json.load(open(os.path.join(ROOT, "flood_out", "design_storm_24h.json"),
-                        encoding="utf-8"))
+    d = _json.loads((tmp_path / "flood_out" / "design_storm_24h.json").read_text(encoding="utf-8"))
     assert abs(d["100"] - 300.6) <= 2.0, d
     print("prep_design_storm.py 复现 OK(100y=%s mm)" % d["100"])
 
